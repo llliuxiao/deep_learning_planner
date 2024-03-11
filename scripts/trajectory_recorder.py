@@ -3,34 +3,33 @@ A python script to record trajectory information tuple for pretraining
 Goal pose and cmd_vel are recorded in a json file while laser scan are recorded in a binary file by numpy(.npy)
 """
 
+import copy
+import enum
+import json
 # utils
 import math
+import os
 import random
 import sys
 import threading
-import json
-import enum
-from tqdm import tqdm
-import angles
-import numpy as np
-import copy
-import os
 
+import message_filters
+import numpy as np
 # ROS
 import rospy
+import tf2_geometry_msgs
 from actionlib import SimpleActionClient
-from isaac_sim.msg import ResetPosesGoal, ResetPosesAction
-from geometry_msgs.msg import Pose, Twist, TwistStamped, TransformStamped, Transform
+from geometry_msgs.msg import Pose, Twist, TwistStamped
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion
+from isaac_sim.msg import ResetPosesGoal, ResetPosesAction
+from move_base_msgs.msg import MoveBaseGoal, MoveBaseResult, MoveBaseAction
 from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Empty
 from std_srvs.srv import Empty
 from tf.transformations import euler_from_quaternion
-import message_filters
-from sensor_msgs.msg import LaserScan
-from tf2_ros import Buffer, TransformListener, LookupException, TransformException
-import tf2_geometry_msgs
-from actionlib_msgs.msg import GoalStatusArray
+from tf2_ros import Buffer, TransformListener, TransformException
+from tqdm import tqdm
 
 # robot parameters:
 robot_radius = 0.3
@@ -71,24 +70,20 @@ class TrajectoryRecorder:
         # write threading
         self.dataset_thread = threading.Thread(target=self._writing_thread)
         self.dataset_lock = threading.Lock()
+        self.dataset_condition_lock = threading.Condition()
 
         # ros communication
         self.scan_sub = message_filters.Subscriber("/scan", LaserScan)
         self.cmd_vel_sub = message_filters.Subscriber("/cmd_vel_stamped", TwistStamped)
         self.msg_filter = message_filters.TimeSynchronizer([self.scan_sub, self.cmd_vel_sub], 10)
-        self.msg_filter.registerCallback(self._callback)
+        self.msg_filter.registerCallback(self._sensor_callback)
 
         self.close_client = rospy.ServiceProxy("/close", Empty)
         self.map_sub = rospy.Subscriber("/map", OccupancyGrid, self._map_callback)
-        self.initial_goal_pub = rospy.Publisher('/move_base_simple/goal', PoseStamped, queue_size=1, latch=True)
         self.initial_pose_pub = rospy.Publisher('/initialpose', PoseWithCovarianceStamped, queue_size=1, latch=True)
         self.reset_client = SimpleActionClient("/reset", ResetPosesAction)
         self.cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=5)
-        self.status_sub = rospy.Subscriber("/move_base/status", GoalStatusArray, self._status_callback)
-
-        # Trapped
-        self.last_point = Transform()
-        self.last_time = None
+        self.nav_client = SimpleActionClient("move_base", MoveBaseAction)
 
         # Poses
         self.start_pose = Pose()
@@ -114,12 +109,12 @@ class TrajectoryRecorder:
             dataset.clear()
             del dataset
 
-    def _callback(self, scan_msg: LaserScan, cmd_vel_msg: TwistStamped):
+    def _sensor_callback(self, scan_msg: LaserScan, cmd_vel_msg: TwistStamped):
         try:  # try to transform global target pose to the robot base_link
             point = tf2_geometry_msgs.PoseStamped()
             point.pose = self.target_pose
             point.header.frame_id = "map"
-            target_pose = self.tf_buffer.transform(point, "base_link", rospy.Duration(1))
+            target_pose = self.tf_buffer.transform(point, "base_link")
             assert isinstance(target_pose, PoseStamped)
         except TransformException:
             rospy.logfatal("could not transform target to robot base_link")
@@ -145,16 +140,20 @@ class TrajectoryRecorder:
 
     def reset(self, trajectory_num):
         rospy.logdebug("Start initializing robot...")
+        # reset pbar description
         self.pbar.set_description(f"trajectory{trajectory_num}")
+
+        # set step num
         self.trajectory_num = trajectory_num
         self.step_num = 0
+
         self.dataset_info[f"trajectory{trajectory_num}"] = []
         if os.path.exists(f"{dataset_root_path}/trajectory{trajectory_num}"):
             os.system(f"rm -rf {dataset_root_path}/trajectory{trajectory_num}")
         os.mkdir(f"{dataset_root_path}/trajectory{trajectory_num}")
 
+        # reset robot pose in isaac sim
         self.start_pose = self._get_random_pos_on_map(self.map)
-
         reset_goal = ResetPosesGoal()
         pose = PoseStamped()
         pose.pose = self.start_pose
@@ -168,11 +167,13 @@ class TrajectoryRecorder:
         # wait for isaac sim reset robot position
         rospy.sleep(2.0)
 
+        # reset robot pose for amcl
         self.cmd_vel_pub.publish(Twist())
         self._pub_initial_position(self.start_pose)
 
         # wait for amcl updating localization
         rospy.sleep(2.0)
+        self.state = RobotState.RUNNING
 
         # get a random goal where the target distance is between 5-10m
         while True:
@@ -184,7 +185,7 @@ class TrajectoryRecorder:
         self._publish_goal_position(self.target_pose)
 
         # wait for global planner calculating a global path
-        rospy.sleep(4.0)
+        rospy.sleep(3.0)
 
         rospy.logdebug("Finish initializing robot...")
 
@@ -211,11 +212,11 @@ class TrajectoryRecorder:
         self.initial_pose_pub.publish(inital_pose)
 
     def _publish_goal_position(self, pose: Pose):
-        goal = PoseStamped()
-        goal.header.stamp = rospy.Time.now()
-        goal.header.frame_id = "map"
-        goal.pose = pose
-        self.initial_goal_pub.publish(goal)
+        goal = MoveBaseGoal()
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.header.frame_id = "map"
+        goal.target_pose.pose = pose
+        self.nav_client.send_goal(goal, done_cb=self._nav_callback_done)
 
     def _get_random_pos_on_map(self, grid_map) -> Pose:
         pose = Pose()
@@ -264,77 +265,30 @@ class TrajectoryRecorder:
         del self.dataset_info[f"trajectory{trajectory_num}"]
 
     def reset_pbar(self, last_step):
-        self.pbar.clear()
+        self.pbar.reset(total=max_step)
         self.pbar.update(last_step)
 
-    # uint8 PENDING=0
-    # uint8 ACTIVE=1
-    # uint8 PREEMPTED=2
-    # uint8 SUCCEEDED=3
-    # uint8 ABORTED=4
-    # uint8 REJECTED=5
-    # uint8 PREEMPTING=6
-    # uint8 RECALLING=7
-    # uint8 RECALLED=8
-    # uint8 LOST=9
-    def _status_callback(self, msg: GoalStatusArray):
-        try:
-            status = msg.status_list[0].status
-        except IndexError:
-            rospy.logwarn("empty status array")
-            return
-        if status == 3:
+    # Goal State Code
+    # uint8 PENDING         = 0
+    # uint8 ACTIVE          = 1
+    # uint8 PREEMPTED       = 2
+    # uint8 SUCCEEDED       = 3
+    # uint8 ABORTED         = 4
+    # uint8 REJECTED        = 5
+    # uint8 PREEMPTING      = 6
+    # uint8 RECALLING       = 7
+    # uint8 RECALLED        = 8
+    # uint8 LOST            = 9
+    def _nav_callback_done(self, state: int, result: MoveBaseResult):
+        if state == 3:
             self.state = RobotState.REACHED
-        elif status == 4 or status == 5:
+        elif state == 4 or self == 5:
             self.state = RobotState.TRAPPED
         else:
             self.state = RobotState.RUNNING
 
-    def get_state(self):
-        try:
-            curr_pose = self.tf_buffer.lookup_transform(
-                source_frame="base_link",
-                target_frame="map",
-                time=rospy.Time(0),
-                timeout=rospy.Duration(2)
-            )
-            assert isinstance(curr_pose, TransformStamped)
-        except LookupException or TransformException:
-            rospy.logfatal("could not get robot pose, will try it again")
-            return False
-        except AssertionError:
-            rospy.logfatal(
-                "the type of return of lookup transform is not TransformStamped, system exits modify it now!")
-            sys.exit(-1)
-        delta_x = curr_pose.transform.translation.x - self.last_point.translation.x
-        delta_y = curr_pose.transform.translation.y - self.last_point.translation.y
-        cur_yaw = self._get_yaw(curr_pose.transform.rotation)
-        last_yaw = self._get_yaw(self.last_point.rotation)
-        delta_alpha = math.fabs(angles.normalize_angle(cur_yaw - last_yaw))
-
-        if math.sqrt(delta_x ** 2 + delta_y ** 2) > 0.1 or delta_alpha > math.pi / 6:
-            self.last_point = curr_pose.transform
-            self.last_time = rospy.Time.now()
-
-        # 1) Goal reached?
-        dist_to_goal = np.linalg.norm(
-            np.array([
-                curr_pose.transform.translation.x - self.target_pose.position.x,
-                curr_pose.transform.translation.y - self.target_pose.position.y,
-                curr_pose.transform.translation.z - self.target_pose.position.z
-            ])
-        )
-        angle_to_goal = math.fabs(angles.normalize_angle(cur_yaw - self._get_yaw(self.target_pose.orientation)))
-        if dist_to_goal <= goal_radius and angle_to_goal <= angle_threshold:
-            rospy.loginfo("Carter reached the goal!")
-            return RobotState.REACHED
-
-        # 2) Robot Trapped?
-        if rospy.Time.now().to_sec() - self.last_time.to_sec() > max_trapped_time:
-            rospy.logfatal("Carter was trapped for a long time")
-            return RobotState.TRAPPED
-
-        return RobotState.RUNNING
+    def _global_path_callback(self, msg):
+        pass
 
 
 if __name__ == "__main__":
@@ -355,6 +309,7 @@ if __name__ == "__main__":
                 recorder.reset_pbar(step)
                 break
             rospy.sleep(0.05)
-        recorder.reset(num)
+        if step < max_step:
+            recorder.reset(num)
     recorder.close()
     print("shut down")
