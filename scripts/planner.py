@@ -16,13 +16,14 @@ from sensor_msgs.msg import LaserScan
 import tf2_geometry_msgs
 from tf.transformations import euler_from_quaternion
 
-model_file = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/logs/epoch99.pth"
+model_file = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/logs/model0/best.pth"
 
 
 class DeepMotionPlanner:
     def __init__(self):
-        self.model = Model()
         self.device = torch.device("cuda")
+        self.model = Model()
+        self.model = torch.nn.DataParallel(self.model).to(self.device)
         param = torch.load(model_file)["model_state_dict"]
         self.model.load_state_dict(param)
 
@@ -38,7 +39,7 @@ class DeepMotionPlanner:
         self.goal = None
 
     def laser_callback(self, msg: LaserScan):
-        self.laser = msg
+        self.laser = msg.ranges
 
     def goal_callback(self, msg: PoseStamped):
         self.goal = msg
@@ -61,28 +62,33 @@ class DeepMotionPlanner:
         else:
             return False
 
-    def cmd_inference(self):
+    def cmd_inference(self, event):
         if self.goal is None or self.is_done():
             return
         laser = torch.Tensor(self.laser).float()
         cmd_vel = Twist()
         goal = tf2_geometry_msgs.PoseStamped()
         goal.pose = self.goal.pose
-        goal.header = self.goal.header
+        goal.header.stamp = rospy.Time(0)
+        goal.header.frame_id = "map"
         try:
             target_pose = self.tf_buffer.transform(goal, "base_link")
             assert isinstance(target_pose, PoseStamped)
-        except tf2_ros.TransformException:
+        except tf2_ros.TransformException as ex:
+            rospy.logfatal(ex)
             rospy.logfatal("could not transform goal to the robot frame")
             return
         goal = (target_pose.pose.position.x, target_pose.pose.position.y, self._get_yaw(target_pose.pose.orientation))
         goal = torch.Tensor(goal).float()
         tensor = torch.concat((laser, goal))
         tensor = torch.reshape(tensor, (1, 1, len(tensor))).to(self.device)
-        predict = self.model(tensor)
+        self.model.train(False)
+        with torch.no_grad():
+            predict = self.model(tensor)
         predict = torch.squeeze(predict)
         cmd_vel.linear.x = predict[0].item()
         cmd_vel.angular.z = predict[1].item()
+        self.cmd_vel_pub.publish(cmd_vel)
 
     @staticmethod
     def _get_yaw(quaternion: Quaternion):

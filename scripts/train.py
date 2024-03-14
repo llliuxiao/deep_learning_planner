@@ -1,17 +1,18 @@
 # torch
-# utils
-import json
-import os
-
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.tensorboard import SummaryWriter
+from network import Model
+
+# utils
+import json
+import math
+import os
+import numpy as np
+
 # visualization
 from tqdm import tqdm
-
-from network import Model
+from torch.utils.tensorboard import SummaryWriter
 
 linux_user = os.getlogin()
 train_dataset_root = f"/home/{linux_user}/Downloads/pretraining_dataset"
@@ -19,8 +20,18 @@ eval_dataset_root = f"/home/{linux_user}/Downloads/pretraining_dataset_eval"
 
 ignore_init_step_num = 50
 ignore_end_step_num = 100
-subsample_interval = 4
+subsample_interval = 2
 save_root = f"/home/{linux_user}/isaac_sim_ws/src/supervised_learning_planner/logs"
+index = 0
+while True:
+    if os.path.exists(f"{save_root}/model{index}"):
+        index += 1
+        continue
+    model_save_dir = f"{save_root}/model{index}"
+    os.mkdir(model_save_dir)
+    train_save_dir = f"{save_root}/runs/train{index}"
+    eval_save_dir = f"{save_root}/runs/eval{index}"
+    break
 
 
 class RobotDataset(Dataset):
@@ -89,10 +100,23 @@ class DeepMotionPlannerTrainner:
         self.train_data_loader = load_data("train", batch_size)
         self.eval_data_loader = load_data("eval", batch_size)
 
-        self.summary_writer = SummaryWriter(f"{save_root}/runs")
+        self.train_summary_writer = SummaryWriter(train_save_dir)
+        self.eval_summary_writer = SummaryWriter(eval_save_dir)
 
         self.training_total_step = 0
         self.eval_total_step = 0
+
+        self.best_loss = math.inf
+        torch.manual_seed(1)
+        print(self.model)
+
+    def get_single_loss(self, predicts, targets):
+        sub = torch.sub(targets, predicts)
+        fabs = torch.abs(sub)
+        sum = torch.sum(fabs, dim=0)
+        squeeze = torch.squeeze(sum)
+        divide = torch.divide(squeeze, torch.tensor(len(predicts), dtype=torch.float))
+        return divide[0].item(), divide[1].item()
 
     def train(self, num):
         self.model.train(True)
@@ -116,9 +140,12 @@ class DeepMotionPlannerTrainner:
                 epoch_loss += len(data) * loss.item()
                 pbar.update(len(data))
                 if j % 50 == 0:
-                    self.summary_writer.add_scalar("training_loss", loss.item(), self.training_total_step)
-        self.summary_writer.add_scalar("learning_rate", self.lr_decay.get_lr()[0], num)
-        self.summary_writer.add_scalar("train_epoch_loss", epoch_loss.item() / epoch_steps, num)
+                    self.train_summary_writer.add_scalar("step_loss", loss.item(), self.training_total_step)
+                    linear, angular = self.get_single_loss(predict, cmd_vel)
+                    self.train_summary_writer.add_scalar("training_linear_loss", linear, self.training_total_step)
+                    self.train_summary_writer.add_scalar("training_angular_loss", angular, self.training_total_step)
+        self.train_summary_writer.add_scalar("learning_rate", self.lr_decay.get_lr()[0], num)
+        self.train_summary_writer.add_scalar("epoch_loss", epoch_loss.item() / epoch_steps, num)
 
     def eval(self, num):
         self.model.train(False)
@@ -135,8 +162,9 @@ class DeepMotionPlannerTrainner:
                 epoch_loss += len(data) * loss.item()
                 self.eval_total_step += len(data)
                 if j % 50 == 0:
-                    self.summary_writer.add_scalar("eval_loss", loss.item(), self.eval_total_step)
-        self.summary_writer.add_scalar("eval_epoch_loss", epoch_loss.item() / epoch_steps, num)
+                    self.eval_summary_writer.add_scalar("step_loss", loss.item(), self.eval_total_step)
+        self.eval_summary_writer.add_scalar("epoch_loss", epoch_loss.item() / epoch_steps, num)
+        self.save_best_model(epoch_loss.item() / epoch_steps, num)
 
     def save_checkpoint(self, num):
         checkpoint = {
@@ -144,16 +172,27 @@ class DeepMotionPlannerTrainner:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "epoch": num
         }
-        torch.save(checkpoint, f"{save_root}/epoch{num}.pth")
+        torch.save(checkpoint, f"{model_save_dir}/epoch{num}.pth")
+
+    def save_best_model(self, loss, num):
+        if loss < self.best_loss:
+            self.best_loss = loss
+            checkpoint = {
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "epoch": num
+            }
+            torch.save(checkpoint, f"{model_save_dir}/best.pth")
 
 
 if __name__ == "__main__":
     planner = DeepMotionPlannerTrainner()
-    epoch = 100
+    epoch = 200
     for i in range(epoch):
         planner.train(i)
         planner.eval(i)
-        planner.save_checkpoint(i)
-        if i > 0 and i % 2 == 0:
+        # planner.save_checkpoint(i)
+        if i > 0 and i % 3 == 0:
             planner.lr_decay.step()
-    planner.summary_writer.close()
+    planner.train_summary_writer.close()
+    planner.eval_summary_writer.close()
