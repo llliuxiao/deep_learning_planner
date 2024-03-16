@@ -16,7 +16,7 @@ from sensor_msgs.msg import LaserScan
 import tf2_geometry_msgs
 from tf.transformations import euler_from_quaternion
 
-model_file = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/logs/model0/best.pth"
+model_file = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/logs/model/best.pth"
 
 
 class DeepMotionPlanner:
@@ -88,6 +88,7 @@ class DeepMotionPlanner:
         predict = torch.squeeze(predict)
         cmd_vel.linear.x = predict[0].item()
         cmd_vel.angular.z = predict[1].item()
+        rospy.loginfo_throttle(1, f"linear:{cmd_vel.linear.x}, angular:{cmd_vel.angular.z}")
         self.cmd_vel_pub.publish(cmd_vel)
 
     @staticmethod
