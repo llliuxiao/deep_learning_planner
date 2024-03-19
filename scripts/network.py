@@ -50,12 +50,18 @@ class Model(torch.nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(4675, 1024), nn.ReLU(), nn.Dropout(p=dropout_rate),
             nn.Linear(1024, 1024), nn.ReLU(), nn.Dropout(p=dropout_rate),
-            nn.Linear(1024, 512), nn.ReLU(), nn.Dropout(p=dropout_rate),
-            nn.Linear(512, 2)
         )
+        self.actor = nn.Sequential(
+            nn.Linear(1024, 512), nn.ReLU(), nn.Dropout(p=dropout_rate),
+        )
+        self.action_net = nn.Linear(512, 2)
+        self.critic = nn.Sequential(
+            nn.Linear(1024, 256), nn.ReLU(), nn.Dropout(p=dropout_rate),
+        )
+        self.value_net = nn.Linear(256, 1)
 
     def forward(self, tensor):
-        laser, goal, last_cmd_vel = tensor[:, :, :900], tensor[:, :, 900:903], tensor[:, :, 903:]
+        laser, goal = tensor[:, :, :900], tensor[:, :, 900:903]
         goal = torch.reshape(goal, (-1, 3))
         conv1 = self.conv1(laser)
         conv2 = self.conv2(conv1)
@@ -65,4 +71,4 @@ class Model(torch.nn.Module):
         avg_pool = self.avg_pool(res2)
         avg_pool = torch.reshape(avg_pool, (-1, 4672))
         concat = torch.concat((avg_pool, goal), dim=1)
-        return self.mlp(concat)
+        return self.action_net(self.actor(self.mlp(concat)))

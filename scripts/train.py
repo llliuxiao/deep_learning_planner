@@ -94,7 +94,7 @@ class DeepMotionPlannerTrainner:
         self.model = nn.DataParallel(self.model).to(self.device)
         # self.loss_fn = torch.nn.MSELoss()
         self.loss_fn = VelocityCmdLoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=0.001)
         self.lr_decay = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.98)
 
         self.train_data_loader = load_data("train", batch_size)
