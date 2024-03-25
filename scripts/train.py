@@ -18,9 +18,9 @@ linux_user = os.getlogin()
 train_dataset_root = f"/home/{linux_user}/Downloads/pretraining_dataset"
 eval_dataset_root = f"/home/{linux_user}/Downloads/pretraining_dataset_eval"
 
-ignore_init_step_num = 50
-ignore_end_step_num = 100
-subsample_interval = 2
+ignore_init_step_num = 0
+ignore_end_step_num = 0
+subsample_interval = 1
 save_root = f"/home/{linux_user}/isaac_sim_ws/src/supervised_learning_planner/logs"
 index = 0
 while True:
@@ -49,22 +49,22 @@ class RobotDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, item):
-        (goal, cmd_vel, last_cmd_vel, laser_path) = self.data[item]
-        laser = np.load(laser_path)
-        return (torch.concat([torch.from_numpy(laser).float(), torch.Tensor(goal).float(),
-                              torch.Tensor(last_cmd_vel).float()]), torch.Tensor(cmd_vel).float())
+        (goal, cmd_vel, laser_path) = self.data[item]
+        # the max range of laser is 10m. so here normalize it to [0, 1]
+        laser = np.load(laser_path) / 10.0
+        goal = np.array(goal) / np.array([10.0, 10.0, math.pi])
+        return (torch.concat([torch.from_numpy(laser).float(), torch.from_numpy(goal).float()]),
+                torch.Tensor(cmd_vel).float())
 
     def _subsample(self):
         for (_, trajectory) in self.raw_data.items():
             length = len(trajectory["data"])
             for num in range(ignore_init_step_num, length - ignore_end_step_num, subsample_interval):
                 step = trajectory["data"][num]
-                last_step = trajectory["data"][num - 1]
                 target = (step["target_x"], step["target_y"], step["target_yaw"])
                 cmd_vel = (step["cmd_vel_linear"], step["cmd_vel_angular"])
-                last_cmd_vel = (last_step["cmd_vel_linear"], last_step["cmd_vel_angular"])
                 laser_path = step["laser_path"]
-                self.data.append((target, cmd_vel, last_cmd_vel, laser_path))
+                self.data.append((target, cmd_vel, laser_path))
 
 
 def load_data(mode, batch_size):
@@ -94,7 +94,7 @@ class DeepMotionPlannerTrainner:
         self.model = nn.DataParallel(self.model).to(self.device)
         # self.loss_fn = torch.nn.MSELoss()
         self.loss_fn = VelocityCmdLoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=0.001)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=0.00001)
         self.lr_decay = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.98)
 
         self.train_data_loader = load_data("train", batch_size)
@@ -125,7 +125,7 @@ class DeepMotionPlannerTrainner:
         with tqdm(total=len(self.train_data_loader), desc=f"training_epoch{num}") as pbar:
             for j, (data, cmd_vel) in enumerate(self.train_data_loader):
                 cmd_vel = cmd_vel.to(self.device)
-                data = torch.reshape(data, (-1, 1, 905))
+                data = torch.reshape(data, (-1, 1, 903))
                 predict = self.model(data)
                 loss = self.loss_fn(predict, cmd_vel)
 
@@ -154,7 +154,7 @@ class DeepMotionPlannerTrainner:
         with torch.no_grad and tqdm(total=len(self.eval_data_loader), desc=f"evaluating_epoch{num}") as pbar:
             for j, (data, cmd_vel) in enumerate(self.eval_data_loader):
                 cmd_vel = cmd_vel.to(self.device)
-                data = torch.reshape(data, (-1, 1, 905))
+                data = torch.reshape(data, (-1, 1, 903))
                 predict = self.model(data)
                 loss = self.loss_fn(predict, cmd_vel)
                 pbar.update(len(data))

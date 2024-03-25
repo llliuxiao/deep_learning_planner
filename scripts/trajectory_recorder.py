@@ -184,7 +184,7 @@ class TrajectoryRecorder:
             self.target_pose = self._get_random_pos_on_map(self.map)
             dx = self.target_pose.position.x - self.start_pose.position.x
             dy = self.target_pose.position.y - self.start_pose.position.y
-            if 5 <= math.sqrt(dx ** 2 + dy ** 2) <= 10:
+            if 2 <= math.sqrt(dx ** 2 + dy ** 2) <= 100:
                 break
         self.dataset_info[f"trajectory{trajectory_num}"] = {
             "start_x": self.start_pose.position.x,

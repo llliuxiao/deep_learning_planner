@@ -66,6 +66,7 @@ class DeepMotionPlanner:
         if self.goal is None or self.is_done():
             return
         laser = torch.Tensor(self.laser).float()
+        laser = torch.divide(laser, torch.tensor(10.0))
         cmd_vel = Twist()
         goal = tf2_geometry_msgs.PoseStamped()
         goal.pose = self.goal.pose
@@ -80,6 +81,7 @@ class DeepMotionPlanner:
             return
         goal = (target_pose.pose.position.x, target_pose.pose.position.y, self._get_yaw(target_pose.pose.orientation))
         goal = torch.Tensor(goal).float()
+        goal = torch.divide(goal, torch.Tensor((10.0, 10.0, torch.pi)))
         tensor = torch.concat((laser, goal))
         tensor = torch.reshape(tensor, (1, 1, len(tensor))).to(self.device)
         self.model.train(False)
