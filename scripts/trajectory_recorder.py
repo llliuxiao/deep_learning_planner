@@ -13,6 +13,7 @@ import copy
 import enum
 import json
 import numpy as np
+import cv2 as cv
 
 # ROS
 import rospy
@@ -23,7 +24,7 @@ from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion
 from isaac_sim.msg import ResetPosesGoal, ResetPosesAction
 from move_base_msgs.msg import MoveBaseGoal, MoveBaseResult, MoveBaseAction
 from nav_msgs.msg import OccupancyGrid, Path
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, Image
 from std_msgs.msg import Empty
 from std_srvs.srv import Empty
 from tf.transformations import euler_from_quaternion
@@ -61,7 +62,9 @@ class TrajectoryRecorder:
         # pool
         self.trajectory_num = 0
         self.step_num = 0
-        self.dataset_pool = []
+        self.laser_dataset_pool = []
+        self.image_dataset_pool = []
+        self.depth_dataset_pool = []
         self.dataset_info = {}
 
         # ros tf
@@ -76,7 +79,10 @@ class TrajectoryRecorder:
         # ros communication
         self.scan_sub = message_filters.Subscriber("/scan", LaserScan)
         self.cmd_vel_sub = message_filters.Subscriber("/cmd_vel_stamped", TwistStamped)
-        self.msg_filter = message_filters.TimeSynchronizer([self.scan_sub, self.cmd_vel_sub], 10)
+        self.image_sub = message_filters.Subscriber("/rgb_left", Image)
+        self.depth_image_sub = message_filters.Subscriber("/depth_left", Image)
+        fs = [self.scan_sub, self.cmd_vel_sub, self.image_sub, self.depth_image_sub]
+        self.msg_filter = message_filters.TimeSynchronizer(fs, 10)
         self.msg_filter.registerCallback(self._sensor_callback)
 
         self.close_client = rospy.ServiceProxy("/close", Empty)
@@ -104,17 +110,31 @@ class TrajectoryRecorder:
     def _writing_thread(self):
         while not self.close_signal:
             self.dataset_condition_lock.acquire()
-            if len(self.dataset_pool) == 0:
+            if len(self.laser_dataset_pool) == 0:
                 self.dataset_condition_lock.wait()
-            dataset = copy.deepcopy(self.dataset_pool)
-            self.dataset_pool.clear()
+            laser_dataset = copy.deepcopy(self.laser_dataset_pool)
+            image_dataset = copy.deepcopy(self.image_dataset_pool)
+            depth_dataset = copy.deepcopy(self.depth_dataset_pool)
+            self.laser_dataset_pool.clear()
+            self.image_dataset_pool.clear()
+            self.depth_dataset_pool.clear()
             self.dataset_condition_lock.release()
-            for (laser, path) in dataset:
-                np.save(path, np.array(laser))
-            dataset.clear()
-            del dataset
+            for i in range(len(laser_dataset)):
+                laser, laser_path = laser_dataset[i]
+                image, image_path = image_dataset[i]
+                depth, depth_path = depth_dataset[i]
+                np.save(laser_path, np.array(laser))
+                assert isinstance(image, Image)
+                data = image.data
+                data = np.reshape(data, (image.height, image.width))
+                cv.imwrite(image_path, data)
+                data = depth.data
+                data = np.reshape(data, (depth.height, depth.width))
+                cv.imwrite(depth_path, data)
+            del laser_dataset
+            del image_dataset
 
-    def _sensor_callback(self, scan_msg: LaserScan, cmd_vel_msg: TwistStamped):
+    def _sensor_callback(self, scan_msg: LaserScan, cmd_vel_msg: TwistStamped, image_msg: Image, depth_msg: Image):
         try:  # try to transform global target pose to the robot base_link
             point = tf2_geometry_msgs.PoseStamped()
             point.pose = self.target_pose
@@ -129,6 +149,10 @@ class TrajectoryRecorder:
             sys.exit(-1)
 
         laser_path = os.path.join(f"{dataset_root_path}/trajectory{self.trajectory_num}", f"step{self.step_num}.npy")
+        image_path = os.path.join(f"{dataset_root_path}/trajectory{self.trajectory_num}",
+                                  f"step{self.step_num}_rgb.png")
+        depth_path = os.path.join(f"{dataset_root_path}/trajectory{self.trajectory_num}",
+                                  f"step{self.step_num}_depth.png")
         data = {
             "time": rospy.Time.now().to_sec(),
             "target_x": target_pose.pose.position.x,
@@ -140,7 +164,9 @@ class TrajectoryRecorder:
         }
         self.dataset_info[f"trajectory{self.trajectory_num}"]["data"].append(data)
         self.dataset_condition_lock.acquire()
-        self.dataset_pool.append((scan_msg.ranges, laser_path))
+        self.laser_dataset_pool.append((scan_msg.ranges, laser_path))
+        self.image_dataset_pool.append((image_msg, image_path))
+        self.depth_dataset_pool.append((depth_msg, depth_path))
         self.dataset_condition_lock.notify()
         self.dataset_condition_lock.release()
         self.step_num += 1
@@ -318,8 +344,7 @@ class TrajectoryRecorder:
 if __name__ == "__main__":
     rospy.init_node("trajectory_recorder")
     recorder = TrajectoryRecorder()
-    num = 0
-    step = 0
+    num, step = 0, 0
     while step < max_step:
         while True:
             if recorder.state == RobotState.REACHED:
