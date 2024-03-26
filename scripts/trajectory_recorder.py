@@ -14,12 +14,13 @@ import enum
 import json
 import numpy as np
 import cv2 as cv
+from cv_bridge import CvBridge
 
 # ROS
 import rospy
 import tf2_geometry_msgs
 from actionlib import SimpleActionClient
-from geometry_msgs.msg import Pose, Twist, TwistStamped
+from geometry_msgs.msg import Pose, Twist, TwistStamped, TransformStamped
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion
 from isaac_sim.msg import ResetPosesGoal, ResetPosesAction
 from move_base_msgs.msg import MoveBaseGoal, MoveBaseResult, MoveBaseAction
@@ -39,9 +40,11 @@ angle_threshold = 0.5
 max_trapped_time = 10.0
 
 # global const
-max_step = 2000
+max_step = int(1e6)
 linux_user = os.getlogin()
-dataset_root_path = f"/home/{linux_user}/Downloads/pretraining_dataset"
+dataset_root_path = f"/home/{linux_user}/Downloads/pretraining_dataset/hospital"
+if not os.path.exists(dataset_root_path):
+    os.mkdir(dataset_root_path)
 global_path_subsample = 4
 
 
@@ -125,22 +128,24 @@ class TrajectoryRecorder:
                 depth, depth_path = depth_dataset[i]
                 np.save(laser_path, np.array(laser))
                 assert isinstance(image, Image)
-                data = image.data
-                data = np.reshape(data, (image.height, image.width))
+                data = CvBridge().imgmsg_to_cv2(image)
                 cv.imwrite(image_path, data)
-                data = depth.data
-                data = np.reshape(data, (depth.height, depth.width))
-                cv.imwrite(depth_path, data)
+                data = CvBridge().imgmsg_to_cv2(depth)
+                np.save(depth_path, data)
             del laser_dataset
             del image_dataset
 
     def _sensor_callback(self, scan_msg: LaserScan, cmd_vel_msg: TwistStamped, image_msg: Image, depth_msg: Image):
+        if f"trajectory{self.trajectory_num}" not in self.dataset_info.keys():
+            return
         try:  # try to transform global target pose to the robot base_link
             point = tf2_geometry_msgs.PoseStamped()
             point.pose = self.target_pose
             point.header.frame_id = "map"
             target_pose = self.tf_buffer.transform(point, "base_link")
+            robot_pose = self.tf_buffer.lookup_transform("map", "base_link", rospy.Time(0))
             assert isinstance(target_pose, PoseStamped)
+            assert isinstance(robot_pose, TransformStamped)
         except TransformException:
             rospy.logfatal("could not transform target to robot base_link")
             return
@@ -152,12 +157,15 @@ class TrajectoryRecorder:
         image_path = os.path.join(f"{dataset_root_path}/trajectory{self.trajectory_num}",
                                   f"step{self.step_num}_rgb.png")
         depth_path = os.path.join(f"{dataset_root_path}/trajectory{self.trajectory_num}",
-                                  f"step{self.step_num}_depth.png")
+                                  f"step{self.step_num}_depth.npy")
         data = {
             "time": rospy.Time.now().to_sec(),
             "target_x": target_pose.pose.position.x,
             "target_y": target_pose.pose.position.y,
             "target_yaw": self._get_yaw(target_pose.pose.orientation),
+            "robot_x": robot_pose.transform.translation.x,
+            "robot_y": robot_pose.transform.translation.y,
+            "robot_yaw": self._get_yaw(robot_pose.transform.rotation),
             "cmd_vel_linear": cmd_vel_msg.twist.linear.x,
             "cmd_vel_angular": cmd_vel_msg.twist.angular.z,
             "laser_path": laser_path
@@ -224,7 +232,7 @@ class TrajectoryRecorder:
         self._publish_goal_position(self.target_pose)
 
         # wait for global planner calculating a global path
-        rospy.sleep(4.0)
+        rospy.sleep(5.0)
         self.dataset_info[f"trajectory{trajectory_num}"]["global_path"] = self.global_path
         rospy.logdebug("Finish initializing robot...")
 
@@ -263,11 +271,11 @@ class TrajectoryRecorder:
         pose = Pose()
         map_width = grid_map.info.width * grid_map.info.resolution + grid_map.info.origin.position.x
         map_height = grid_map.info.height * grid_map.info.resolution + grid_map.info.origin.position.y
-        x = random.uniform(0.0, map_width)
-        y = random.uniform(0.0, map_height)
+        x = random.uniform(grid_map.info.origin.position.x, map_width)
+        y = random.uniform(grid_map.info.origin.position.y, map_height)
         while not self._is_pos_valid(x, y, robot_radius, grid_map):
-            x = random.uniform(0.0, map_width)
-            y = random.uniform(0.0, map_height)
+            x = random.uniform(grid_map.info.origin.position.x, map_width)
+            y = random.uniform(grid_map.info.origin.position.y, map_height)
         theta = random.uniform(-math.pi, math.pi)
         pose.position.x = x
         pose.position.y = y
