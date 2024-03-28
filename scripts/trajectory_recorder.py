@@ -3,22 +3,23 @@ A python script to record trajectory information tuple for pretraining
 Goal pose, cmd_vel and global path are recorded in a json file
 while laser scan are recorded in a binary file by numpy(.npy)
 """
+import copy
+import enum
+import json
 # utils
 import math
 import os
 import random
 import sys
 import threading
-import copy
-import enum
-import json
-import numpy as np
 
+import message_filters
+import numpy as np
 # ROS
 import rospy
 import tf2_geometry_msgs
 from actionlib import SimpleActionClient
-from geometry_msgs.msg import Pose, Twist, TwistStamped
+from geometry_msgs.msg import Pose, TwistStamped
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion
 from isaac_sim.msg import ResetPosesGoal, ResetPosesAction
 from move_base_msgs.msg import MoveBaseGoal, MoveBaseResult, MoveBaseAction
@@ -29,18 +30,16 @@ from std_srvs.srv import Empty
 from tf.transformations import euler_from_quaternion
 from tf2_ros import Buffer, TransformListener, TransformException
 from tqdm import tqdm
-import message_filters
 
 # robot parameters:
-robot_radius = 0.3
-goal_radius = 0.3
-angle_threshold = 0.5
-max_trapped_time = 10.0
+robot_radius = 0.5
 
 # global const
-max_step = 2000
+max_step = 500000
 linux_user = os.getlogin()
-dataset_root_path = f"/home/{linux_user}/Downloads/pretraining_dataset"
+dataset_root_path = f"/home/{linux_user}/Downloads/pretraining_dataset/hospital"
+if not os.path.exists(dataset_root_path):
+    os.mkdir(dataset_root_path)
 global_path_subsample = 4
 
 
@@ -61,7 +60,8 @@ class TrajectoryRecorder:
         # pool
         self.trajectory_num = 0
         self.step_num = 0
-        self.dataset_pool = []
+        self.laser_dataset_pool = []
+        self.global_path_pool = []
         self.dataset_info = {}
 
         # ros tf
@@ -76,7 +76,8 @@ class TrajectoryRecorder:
         # ros communication
         self.scan_sub = message_filters.Subscriber("/scan", LaserScan)
         self.cmd_vel_sub = message_filters.Subscriber("/cmd_vel_stamped", TwistStamped)
-        self.msg_filter = message_filters.TimeSynchronizer([self.scan_sub, self.cmd_vel_sub], 10)
+        self.path_sub = message_filters.Subscriber("/move_base/GlobalPlanner/robot_frame_plan", Path)
+        self.msg_filter = message_filters.TimeSynchronizer([self.scan_sub, self.cmd_vel_sub, self.path_sub], 10)
         self.msg_filter.registerCallback(self._sensor_callback)
 
         self.close_client = rospy.ServiceProxy("/close", Empty)
@@ -84,10 +85,6 @@ class TrajectoryRecorder:
         self.initial_pose_pub = rospy.Publisher('/initialpose', PoseWithCovarianceStamped, queue_size=1, latch=True)
         self.reset_client = SimpleActionClient("/reset", ResetPosesAction)
         self.nav_client = SimpleActionClient("move_base", MoveBaseAction)
-        self.path_sub = rospy.Subscriber("/move_base/GlobalPlanner/plan", Path, self._path_callback, queue_size=1)
-
-        # global path
-        self.global_path = []
 
         # Poses
         self.start_pose = Pose()
@@ -104,17 +101,31 @@ class TrajectoryRecorder:
     def _writing_thread(self):
         while not self.close_signal:
             self.dataset_condition_lock.acquire()
-            if len(self.dataset_pool) == 0:
+            if len(self.laser_dataset_pool) == 0:
                 self.dataset_condition_lock.wait()
-            dataset = copy.deepcopy(self.dataset_pool)
-            self.dataset_pool.clear()
+            laser_dataset = copy.deepcopy(self.laser_dataset_pool)
+            global_plan_dataset = copy.deepcopy(self.global_path_pool)
+            self.laser_dataset_pool.clear()
+            self.global_path_pool.clear()
             self.dataset_condition_lock.release()
-            for (laser, path) in dataset:
-                np.save(path, np.array(laser))
-            dataset.clear()
-            del dataset
+            for i in range(len(laser_dataset)):
+                laser, laser_path = laser_dataset[i]
+                global_plan, global_plan_path = global_plan_dataset[i]
+                np.save(laser_path, np.array(laser))
+                poses = []
+                assert isinstance(global_plan, Path)
+                for pose in global_plan.poses:
+                    assert isinstance(pose, PoseStamped)
+                    poses.append([
+                        pose.pose.position.x,
+                        pose.pose.position.y,
+                        self._get_yaw(pose.pose.orientation)
+                    ])
+                np.save(global_plan_path, np.array(poses))
+            del laser_dataset
+            del global_plan_dataset
 
-    def _sensor_callback(self, scan_msg: LaserScan, cmd_vel_msg: TwistStamped):
+    def _sensor_callback(self, scan_msg: LaserScan, cmd_vel_msg: TwistStamped, path_msg: Path):
         try:  # try to transform global target pose to the robot base_link
             point = tf2_geometry_msgs.PoseStamped()
             point.pose = self.target_pose
@@ -128,7 +139,10 @@ class TrajectoryRecorder:
             rospy.logfatal("the type of return of tf buffer transform is not PoseStamped, system exits modify it now!")
             sys.exit(-1)
 
-        laser_path = os.path.join(f"{dataset_root_path}/trajectory{self.trajectory_num}", f"step{self.step_num}.npy")
+        laser_path = os.path.join(f"{dataset_root_path}/trajectory{self.trajectory_num}", f"laser{self.step_num}.npy")
+        global_plan_path = os.path.join(
+            f"{dataset_root_path}/trajectory{self.trajectory_num}",
+            f"global_plan{self.step_num}.npy")
         data = {
             "time": rospy.Time.now().to_sec(),
             "target_x": target_pose.pose.position.x,
@@ -136,11 +150,13 @@ class TrajectoryRecorder:
             "target_yaw": self._get_yaw(target_pose.pose.orientation),
             "cmd_vel_linear": cmd_vel_msg.twist.linear.x,
             "cmd_vel_angular": cmd_vel_msg.twist.angular.z,
-            "laser_path": laser_path
+            "laser_path": laser_path,
+            "global_plan_path": global_plan_path
         }
         self.dataset_info[f"trajectory{self.trajectory_num}"]["data"].append(data)
         self.dataset_condition_lock.acquire()
-        self.dataset_pool.append((scan_msg.ranges, laser_path))
+        self.laser_dataset_pool.append((scan_msg.ranges, laser_path))
+        self.global_path_pool.append((path_msg, global_plan_path))
         self.dataset_condition_lock.notify()
         self.dataset_condition_lock.release()
         self.step_num += 1
@@ -199,7 +215,6 @@ class TrajectoryRecorder:
 
         # wait for global planner calculating a global path
         rospy.sleep(4.0)
-        self.dataset_info[f"trajectory{trajectory_num}"]["global_path"] = self.global_path
         rospy.logdebug("Finish initializing robot...")
 
     def close(self):
@@ -301,18 +316,6 @@ class TrajectoryRecorder:
             self.state = RobotState.TRAPPED
         else:
             self.state = RobotState.RUNNING
-
-    def _path_callback(self, msg: Path):
-        self.global_path.clear()
-        containers = []
-        for pose in msg.poses:
-            x = pose.pose.position.x
-            y = pose.pose.position.y
-            yaw = self._get_yaw(pose.pose.orientation)
-            containers.append((x, y, yaw))
-        self.global_path = containers[::global_path_subsample]
-        if len(containers) % global_path_subsample != 0:
-            self.global_path.append(containers[-1])
 
 
 if __name__ == "__main__":
