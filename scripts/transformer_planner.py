@@ -1,6 +1,6 @@
 # torch
 import torch
-from cnn_network import CNNModel
+from transformer_network import RobotTransformer
 
 # utils
 import angles
@@ -15,14 +15,19 @@ from geometry_msgs.msg import Twist, PoseStamped, Quaternion, TransformStamped
 from sensor_msgs.msg import LaserScan
 import tf2_geometry_msgs
 from tf.transformations import euler_from_quaternion
+from nav_msgs.msg import Path
 
-model_file = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/logs/model/best.pth"
+model_file = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/transformer_logs/model1/best.pth"
+laser_length = 6
+interval = 10
+down_sample = 4
+look_ahead_poses = 20
 
 
-class DeepMotionPlanner:
+class TransformerPlanner:
     def __init__(self):
         self.device = torch.device("cuda")
-        self.model = Model()
+        self.model = RobotTransformer()
         self.model = torch.nn.DataParallel(self.model).to(self.device)
         param = torch.load(model_file)["model_state_dict"]
         self.model.load_state_dict(param)
@@ -30,19 +35,30 @@ class DeepMotionPlanner:
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer)
 
+        self.goal = None
+        self.global_plan = None
+        # make laser pool a queue
+        self.laser_pool = []
+        self.laser_pool_capacity = interval * laser_length
+
         self.scan_sub = rospy.Subscriber("/scan", LaserScan, self.laser_callback, queue_size=1)
+        self.global_plan_sub = rospy.Subscriber("/move_base/GlobalPlanner/robot_frame_plan", Path,
+                                                self.global_plan_callback, queue_size=1)
         self.goal_sub = rospy.Subscriber("/move_base/current_goal", PoseStamped, self.goal_callback, queue_size=1)
         self.cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
-        rospy.Timer(rospy.Duration(secs=0, nsecs=50), self.cmd_inference)
-
-        self.laser = None
-        self.goal = None
+        # 25 HZ
+        rospy.Timer(rospy.Duration(secs=0, nsecs=40000000), self.cmd_inference)
 
     def laser_callback(self, msg: LaserScan):
-        self.laser = msg.ranges
+        if len(self.laser_pool) > self.laser_pool_capacity:
+            self.laser_pool.pop(0)
+        self.laser_pool.append(msg.ranges)
 
     def goal_callback(self, msg: PoseStamped):
         self.goal = msg
+
+    def global_plan_callback(self, msg: Path):
+        self.global_plan = msg
 
     def is_done(self):
         try:
@@ -62,12 +78,29 @@ class DeepMotionPlanner:
         else:
             return False
 
-    def cmd_inference(self, event):
-        if self.goal is None or self.is_done():
-            return
-        laser = torch.Tensor(self.laser).float()
-        laser = torch.divide(laser, torch.tensor(10.0))
-        cmd_vel = Twist()
+    def make_tensor(self):
+        lasers = [self.laser_pool[-1] for _ in range(laser_length)]
+        for i in range(laser_length - 1, 0, -1):
+            prefix = len(self.laser_pool) - i * interval
+            if prefix < 0:
+                continue
+            else:
+                lasers[laser_length - i - 1] = self.laser_pool[prefix]
+        laser_tensor = torch.tensor(lasers, dtype=torch.float).to(self.device)
+        assert isinstance(self.global_plan, Path)
+        global_plan = []
+        for pose in self.global_plan.poses:
+            assert isinstance(pose, PoseStamped)
+            x = pose.pose.position.x
+            y = pose.pose.position.y
+            yaw = self._get_yaw(pose.pose.orientation)
+            global_plan.append((x, y, yaw))
+        global_plan = torch.tensor(global_plan, dtype=torch.float)
+        if len(global_plan) > 0:
+            global_plan = global_plan[:min(len(global_plan), look_ahead_poses * down_sample):down_sample, :]
+        else:
+            global_plan = torch.zeros((look_ahead_poses, 3), dtype=torch.float)
+        global_plan_tensor = global_plan.to(self.device)
         goal = tf2_geometry_msgs.PoseStamped()
         goal.pose = self.goal.pose
         goal.header.stamp = rospy.Time(0)
@@ -80,13 +113,22 @@ class DeepMotionPlanner:
             rospy.logfatal("could not transform goal to the robot frame")
             return
         goal = (target_pose.pose.position.x, target_pose.pose.position.y, self._get_yaw(target_pose.pose.orientation))
-        goal = torch.Tensor(goal).float()
-        goal = torch.divide(goal, torch.Tensor((10.0, 10.0, torch.pi)))
-        tensor = torch.concat((laser, goal))
-        tensor = torch.reshape(tensor, (1, 1, len(tensor))).to(self.device)
+        goal_tensor = torch.tensor(goal, dtype=torch.float).to(self.device)
+        laser_mask = torch.ones((laser_length, laser_length), dtype=torch.bool).triu(1)
+        laser_mask = torch.stack([laser_mask for _ in range(torch.cuda.device_count())]).to(self.device)
+        laser_tensor = torch.unsqueeze(laser_tensor, 0).to(self.device)
+        global_plan_tensor = torch.unsqueeze(global_plan_tensor, 0).to(self.device)
+        goal_tensor = torch.unsqueeze(goal_tensor, 0).to(self.device)
+        return laser_tensor, global_plan_tensor, goal_tensor, laser_mask
+
+    def cmd_inference(self, event):
+        if self.goal is None or self.is_done():
+            return
+        cmd_vel = Twist()
+        laser_tensor, global_plan_tensor, goal_tensor, laser_mask = self.make_tensor()
         self.model.train(False)
         with torch.no_grad():
-            predict = self.model(tensor)
+            predict = self.model(laser_tensor, global_plan_tensor, goal_tensor, laser_mask)
         predict = torch.squeeze(predict)
         cmd_vel.linear.x = predict[0].item()
         cmd_vel.angular.z = predict[1].item()
@@ -100,6 +142,6 @@ class DeepMotionPlanner:
 
 
 if __name__ == "__main__":
-    rospy.init_node("deep_motion_planner")
-    planner = DeepMotionPlanner()
+    rospy.init_node("transformer_planner")
+    planner = TransformerPlanner()
     rospy.spin()

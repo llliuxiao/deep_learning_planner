@@ -71,7 +71,7 @@ class RobotTransformerDataset(Dataset):
         goal = torch.tensor(meta_data.goal, dtype=torch.float)
         cmd_vel = torch.tensor(meta_data.cmd_vel, dtype=torch.float)
         global_plan = torch.from_numpy(np.load(meta_data.global_plan_path)).float()
-        if len(global_plan > 0):
+        if len(global_plan) > 0:
             global_plan = global_plan[:min(len(global_plan), look_ahead_poses * down_sample):down_sample, :]
         else:
             global_plan = torch.zeros((look_ahead_poses, 3), dtype=torch.float)

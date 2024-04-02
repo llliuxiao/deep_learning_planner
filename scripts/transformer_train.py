@@ -66,6 +66,14 @@ class Trainner:
         torch.manual_seed(1)
         print(self.model)
 
+    def resume_checkpoint(self, path):
+        checkpoint_path = path
+        checkpoint = torch.load(checkpoint_path)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"]
+        self.lr_decay.last_epoch = start_epoch
+
     def get_single_loss(self, predicts, targets):
         sub = torch.sub(targets, predicts)
         fabs = torch.abs(sub)
@@ -155,8 +163,10 @@ class Trainner:
             torch.save(checkpoint, f"{model_save_dir}/best.pth")
 
 
+# best_model = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/transformer_logs/model1/best.pth"
 if __name__ == "__main__":
     planner = Trainner()
+    # planner.resume_checkpoint(best_model)
     epoch = 200
     for i in range(epoch):
         planner.train(i)
