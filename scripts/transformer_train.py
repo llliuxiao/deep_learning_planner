@@ -1,27 +1,20 @@
 # torch
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from network import Model
 
 # utils
-import json
 import math
 import os
-import numpy as np
 
 # visualization
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
-linux_user = os.getlogin()
-train_dataset_root = f"/home/{linux_user}/Downloads/pretraining_dataset"
-eval_dataset_root = f"/home/{linux_user}/Downloads/pretraining_dataset_eval"
+from data import load_data
+from transformer_network import RobotTransformer
 
-ignore_init_step_num = 0
-ignore_end_step_num = 0
-subsample_interval = 1
-save_root = f"/home/{linux_user}/isaac_sim_ws/src/supervised_learning_planner/logs"
+linux_user = os.getlogin()
+save_root = f"/home/{linux_user}/isaac_sim_ws/src/supervised_learning_planner/transformer_logs"
 index = 0
 while True:
     if os.path.exists(f"{save_root}/model{index}"):
@@ -32,44 +25,6 @@ while True:
     train_save_dir = f"{save_root}/runs/train{index}"
     eval_save_dir = f"{save_root}/runs/eval{index}"
     break
-
-
-class RobotDataset(Dataset):
-    def __init__(self, mode):
-        if mode == "train":
-            with open(os.path.join(train_dataset_root, "dataset_info.json"), "r") as file:
-                self.raw_data = json.load(file)
-        else:
-            with open(os.path.join(eval_dataset_root, "dataset_info.json"), "r") as file:
-                self.raw_data = json.load(file)
-        self.data = []
-        self._subsample()
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, item):
-        (goal, cmd_vel, laser_path) = self.data[item]
-        # the max range of laser is 10m. so here normalize it to [0, 1]
-        laser = np.load(laser_path) / 10.0
-        goal = np.array(goal) / np.array([10.0, 10.0, math.pi])
-        return (torch.concat([torch.from_numpy(laser).float(), torch.from_numpy(goal).float()]),
-                torch.Tensor(cmd_vel).float())
-
-    def _subsample(self):
-        for (_, trajectory) in self.raw_data.items():
-            length = len(trajectory["data"])
-            for num in range(ignore_init_step_num, length - ignore_end_step_num, subsample_interval):
-                step = trajectory["data"][num]
-                target = (step["target_x"], step["target_y"], step["target_yaw"])
-                cmd_vel = (step["cmd_vel_linear"], step["cmd_vel_angular"])
-                laser_path = step["laser_path"]
-                self.data.append((target, cmd_vel, laser_path))
-
-
-def load_data(mode, batch_size):
-    dataset = RobotDataset(mode)
-    return DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True, num_workers=24)
 
 
 class VelocityCmdLoss(nn.Module):
@@ -85,12 +40,13 @@ class VelocityCmdLoss(nn.Module):
         return torch.divide(torch.sum(sqrt), torch.tensor(len(inputs), dtype=torch.float))
 
 
-class DeepMotionPlannerTrainner:
-    def __init__(self, batch_size=128, lr=1e-3, device=torch.device("cuda")):
+class Trainner:
+    def __init__(self, batch_size=128, lr=1e-5, device=torch.device("cuda"), frame=6):
+        self.frame = frame
         self.lr = lr
         self.batch_size = batch_size
         self.device = device
-        self.model = Model()
+        self.model = RobotTransformer()
         self.model = nn.DataParallel(self.model).to(self.device)
         # self.loss_fn = torch.nn.MSELoss()
         self.loss_fn = VelocityCmdLoss()
@@ -122,11 +78,16 @@ class DeepMotionPlannerTrainner:
         self.model.train(True)
         epoch_loss = torch.tensor(0.0, dtype=torch.float)
         epoch_steps = 0
-        with tqdm(total=len(self.train_data_loader), desc=f"training_epoch{num}") as pbar:
-            for j, (data, cmd_vel) in enumerate(self.train_data_loader):
+        # 定义mask上三角矩阵
+        laser_mask = torch.ones((self.frame, self.frame), dtype=torch.bool).triu(1)
+        laser_mask = torch.stack([laser_mask for _ in range(torch.cuda.device_count())]).to(self.device)
+        with tqdm(total=len(self.train_data_loader) * self.batch_size, desc=f"training_epoch{num}") as pbar:
+            for j, (laser, global_plan, goal, cmd_vel) in enumerate(self.train_data_loader):
                 cmd_vel = cmd_vel.to(self.device)
-                data = torch.reshape(data, (-1, 1, 903))
-                predict = self.model(data)
+                laser = laser.to(self.device)
+                global_plan = global_plan.to(self.device)
+                goal = goal.to(self.device)
+                predict = self.model(laser, global_plan, goal, laser_mask)
                 loss = self.loss_fn(predict, cmd_vel)
 
                 # optimize
@@ -135,10 +96,11 @@ class DeepMotionPlannerTrainner:
                 self.optimizer.step()
 
                 # visualization
-                self.training_total_step += len(data)
-                epoch_steps += len(data)
-                epoch_loss += len(data) * loss.item()
-                pbar.update(len(data))
+                batch_length = laser.shape[0]
+                self.training_total_step += batch_length
+                epoch_steps += batch_length
+                epoch_loss += batch_length * loss.item()
+                pbar.update(batch_length)
                 if j % 50 == 0:
                     self.train_summary_writer.add_scalar("step_loss", loss.item(), self.training_total_step)
                     linear, angular = self.get_single_loss(predict, cmd_vel)
@@ -151,18 +113,26 @@ class DeepMotionPlannerTrainner:
         self.model.train(False)
         epoch_loss = torch.tensor(0.0, dtype=torch.float)
         epoch_steps = 0
-        with torch.no_grad and tqdm(total=len(self.eval_data_loader), desc=f"evaluating_epoch{num}") as pbar:
-            for j, (data, cmd_vel) in enumerate(self.eval_data_loader):
-                cmd_vel = cmd_vel.to(self.device)
-                data = torch.reshape(data, (-1, 1, 903))
-                predict = self.model(data)
-                loss = self.loss_fn(predict, cmd_vel)
-                pbar.update(len(data))
-                epoch_steps += len(data)
-                epoch_loss += len(data) * loss.item()
-                self.eval_total_step += len(data)
-                if j % 50 == 0:
-                    self.eval_summary_writer.add_scalar("step_loss", loss.item(), self.eval_total_step)
+        laser_mask = torch.ones((self.frame, self.frame), dtype=torch.bool).triu(1)
+        laser_mask = torch.stack([laser_mask for _ in range(torch.cuda.device_count())]).to(self.device)
+        with torch.no_grad():
+            with tqdm(total=len(self.eval_data_loader) * self.batch_size, desc=f"evaluating_epoch{num}") as pbar:
+                for j, (laser, global_plan, goal, cmd_vel) in enumerate(self.eval_data_loader):
+                    cmd_vel = cmd_vel.to(self.device)
+                    laser = laser.to(self.device)
+                    global_plan = global_plan.to(self.device)
+                    goal = goal.to(self.device)
+                    predict = self.model(laser, global_plan, goal, laser_mask)
+                    loss = self.loss_fn(predict, cmd_vel)
+
+                    # visualization
+                    batch_length = laser.shape[0]
+                    pbar.update(batch_length)
+                    epoch_steps += batch_length
+                    epoch_loss += batch_length * loss.item()
+                    self.eval_total_step += batch_length
+                    if j % 50 == 0:
+                        self.eval_summary_writer.add_scalar("step_loss", loss.item(), self.eval_total_step)
         self.eval_summary_writer.add_scalar("epoch_loss", epoch_loss.item() / epoch_steps, num)
         self.save_best_model(epoch_loss.item() / epoch_steps, num)
 
@@ -186,7 +156,7 @@ class DeepMotionPlannerTrainner:
 
 
 if __name__ == "__main__":
-    planner = DeepMotionPlannerTrainner()
+    planner = Trainner()
     epoch = 200
     for i in range(epoch):
         planner.train(i)

@@ -25,7 +25,7 @@ class BaseConvolutionBlock(nn.Module):
 
 
 # width = (width + 2 * padding - kernel_size) / stride + 1
-class Model(torch.nn.Module):
+class CNNModel(torch.nn.Module):
     def __init__(self, dropout_rate=0.3):
         super().__init__()
         self.conv1 = nn.Sequential(

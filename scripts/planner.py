@@ -1,6 +1,6 @@
 # torch
 import torch
-from network import Model
+from cnn_network import CNNModel
 
 # utils
 import angles
