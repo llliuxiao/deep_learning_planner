@@ -35,14 +35,14 @@ class TransformerPlanner:
         self.model = torch.nn.DataParallel(self.model).to(self.device)
         param = torch.load(model_file)["model_state_dict"]
         self.model.load_state_dict(param)
+        self.model.train(False)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer)
 
         self.goal = None
         self.global_plan = None
-        self.last_goal = None
-        self.goal_reached = False
+        self.goal_reached = True
 
         # make laser pool as a queue
         self.laser_pool = []
@@ -53,8 +53,8 @@ class TransformerPlanner:
                                                 self.global_plan_callback, queue_size=1)
         self.goal_sub = rospy.Subscriber("/move_base/current_goal", PoseStamped, self.goal_callback, queue_size=1)
         self.cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
-        # 50 HZ
-        rospy.Timer(rospy.Duration(secs=0, nsecs=20000000), self.cmd_inference)
+        # 25 HZ
+        rospy.Timer(rospy.Duration(secs=0, nsecs=40000000), self.cmd_inference)
 
     def laser_callback(self, msg: LaserScan):
         if len(self.laser_pool) > self.laser_pool_capacity:
@@ -62,6 +62,13 @@ class TransformerPlanner:
         self.laser_pool.append(msg.ranges)
 
     def goal_callback(self, msg: PoseStamped):
+        if self.goal is None:
+            self.goal_reached = False
+        else:
+            distance = math.sqrt((msg.pose.position.x - self.goal.pose.position.x) ** 2 +
+                                 (msg.pose.position.y - self.goal.pose.position.y) ** 2)
+            if distance > 0.05:
+                self.goal_reached = False
         self.goal = msg
 
     def global_plan_callback(self, msg: Path):
@@ -73,7 +80,7 @@ class TransformerPlanner:
             assert isinstance(robot_pose, TransformStamped)
         except tf2_ros.TransformException:
             rospy.logfatal("could not get robot pose")
-            return
+            return False
         assert isinstance(self.goal, PoseStamped)
         delta_x = self.goal.pose.position.x - robot_pose.transform.translation.x
         delta_y = self.goal.pose.position.y - robot_pose.transform.translation.y
@@ -81,6 +88,7 @@ class TransformerPlanner:
         # delta_angle = math.fabs(angles.normalize_angle(delta_angle))
         distance = math.sqrt(delta_x ** 2 + delta_y ** 2)
         if distance <= goal_tolerance:
+            self.goal_reached = True
             self.cmd_vel_pub.publish(Twist())
             rospy.logfatal("reach the goal")
             return True
@@ -153,15 +161,18 @@ class TransformerPlanner:
         goal_tensor = torch.unsqueeze(goal_tensor, 0).to(self.device)
         return laser_tensor, global_plan_tensor, goal_tensor, laser_mask
 
-    def cmd_inference(self, event):
-        if self.goal is None or self.is_done():
-            return
-        cmd_vel = Twist()
+    def wait_for_raw_data(self):
         while True:
             if self.global_plan is not None and len(self.laser_pool) > 0:
-                break
+                return
             else:
                 rospy.sleep(0.5)
+
+    def cmd_inference(self, event):
+        if self.goal_reached or self.is_done():
+            return
+        cmd_vel = Twist()
+        self.wait_for_raw_data()
         tensor = self.make_tensor()
         if tensor is None:
             return
