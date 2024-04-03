@@ -86,7 +86,7 @@ class Trainner:
         self.model.train(True)
         epoch_loss = torch.tensor(0.0, dtype=torch.float)
         epoch_steps = 0
-        # 定义mask上三角矩阵
+        # 定义mask上三角矩阵(不含对角线）
         laser_mask = torch.ones((self.frame, self.frame), dtype=torch.bool).triu(1)
         laser_mask = torch.stack([laser_mask for _ in range(torch.cuda.device_count())]).to(self.device)
         with tqdm(total=len(self.train_data_loader) * self.batch_size, desc=f"training_epoch{num}") as pbar:
@@ -172,7 +172,7 @@ if __name__ == "__main__":
         planner.train(i)
         planner.eval(i)
         # planner.save_checkpoint(i)
-        if i > 0 and i % 3 == 0:
+        if i > 0 and i % 5 == 0:
             planner.lr_decay.step()
     planner.train_summary_writer.close()
     planner.eval_summary_writer.close()

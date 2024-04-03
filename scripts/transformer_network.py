@@ -175,14 +175,18 @@ class RobotTransformer(nn.Module):
         super().__init__()
         self.frame = frame
         self.laser_pre = nn.Sequential(
-            nn.AvgPool1d(kernel_size=3, stride=3),
-            nn.Linear(360, 256)
+            # nn.AvgPool1d(kernel_size=3, stride=3),
+            nn.Linear(1080, 512)
         )
         self.global_plan_pre = nn.Linear(3, 256)
-        self.laser_transformer = Transformer(dim=256, dim_head=64, heads=4, depth=6, attn_dropout=0, ff_dropout=0)
-        self.global_plan_transformer = Transformer(dim=256, dim_head=64, heads=4, depth=4, attn_dropout=0, ff_dropout=0)
+        self.laser_transformer = Transformer(dim=512, dim_head=64,
+                                             heads=8, depth=6,
+                                             attn_dropout=0.1, ff_dropout=0.1)
+        self.global_plan_transformer = Transformer(dim=256, dim_head=64,
+                                                   heads=4, depth=4,
+                                                   attn_dropout=0.1, ff_dropout=0.1)
         self.dense = nn.Sequential(
-            nn.Linear(512 + 3, 256), nn.ReLU(),
+            nn.Linear(512 + 256 + 3, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 2)
         )

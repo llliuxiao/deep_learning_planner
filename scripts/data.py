@@ -1,11 +1,12 @@
 import json
 import os.path
+
+import numpy as np
 import pandas as pd
 import torch
+from einops import repeat
 from torch.nn.utils.rnn import pad_sequence
-
 from torch.utils.data import DataLoader, Dataset
-import numpy as np
 
 dataset_root = "/home/gr-agv-lx91/Downloads/pretraining_dataset"
 scenes = ["hospital", "office"]
@@ -73,25 +74,32 @@ class RobotTransformerDataset(Dataset):
         global_plan = torch.from_numpy(np.load(meta_data.global_plan_path)).float()
         if len(global_plan) > 0:
             global_plan = global_plan[:min(len(global_plan), look_ahead_poses * down_sample):down_sample, :]
+            if len(global_plan) < look_ahead_poses:
+                padding = repeat(goal, "d -> b d", b=look_ahead_poses - len(global_plan))
+                global_plan = torch.concat([global_plan, padding])
         else:
-            global_plan = torch.zeros((look_ahead_poses, 3), dtype=torch.float)
+            global_plan = repeat(goal, "d -> b d", b=look_ahead_poses)
         laser = np.array([np.load(path) for path in meta_data.laser_path])
         laser = torch.tensor(laser, dtype=torch.float)
         return laser, global_plan, goal, cmd_vel
 
 
-def collate_fn(batch):
-    laser = torch.stack([item[0] for item in batch])
-    global_plan = [item[1] for item in batch]
-    global_plan = pad_sequence(global_plan, batch_first=True)
-    goal = torch.stack([item[2] for item in batch])
-    cmd_vel = torch.stack([item[3] for item in batch])
-    return laser, global_plan, goal, cmd_vel
+# def collate_fn(batch):
+#     laser = torch.stack([item[0] for item in batch])
+#     global_plan = [item[1] for item in batch]
+#     global_plan = pad_sequence(global_plan, batch_first=True)
+#     goal = torch.stack([item[2] for item in batch])
+#     cmd_vel = torch.stack([item[3] for item in batch])
+#     return laser, global_plan, goal, cmd_vel
 
 
 def load_data(mode: str, batch_size=128):
     data = RobotTransformerDataset(mode)
-    return DataLoader(dataset=data, batch_size=batch_size, collate_fn=collate_fn, shuffle=False, num_workers=24)
+    return DataLoader(dataset=data,
+                      batch_size=batch_size,
+                      # collate_fn=collate_fn,
+                      shuffle=False,
+                      num_workers=24)
 
 
 if __name__ == "__main__":

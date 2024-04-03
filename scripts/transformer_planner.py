@@ -1,27 +1,31 @@
 # torch
 import torch
-from transformer_network import RobotTransformer
+from einops import repeat
 
 # utils
-import angles
 import math
 
 # ros
 import rospy
+import tf2_geometry_msgs
 import tf2_ros
+from geometry_msgs.msg import Twist, PoseStamped, Quaternion, TransformStamped
+from nav_msgs.msg import Path
+from sensor_msgs.msg import LaserScan
+from tf.transformations import euler_from_quaternion
 from tf2_ros import Buffer
 from tf2_ros.transform_listener import TransformListener
-from geometry_msgs.msg import Twist, PoseStamped, Quaternion, TransformStamped
-from sensor_msgs.msg import LaserScan
-import tf2_geometry_msgs
-from tf.transformations import euler_from_quaternion
-from nav_msgs.msg import Path
 
-model_file = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/transformer_logs/model1/best.pth"
+from transformer_network import RobotTransformer
+
+model_file = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/transformer_logs/model3/best.pth"
 laser_length = 6
 interval = 10
 down_sample = 4
 look_ahead_poses = 20
+
+goal_tolerance = 0.3
+deceleration_tolerance = 1.0
 
 
 class TransformerPlanner:
@@ -37,7 +41,10 @@ class TransformerPlanner:
 
         self.goal = None
         self.global_plan = None
-        # make laser pool a queue
+        self.last_goal = None
+        self.goal_reached = False
+
+        # make laser pool as a queue
         self.laser_pool = []
         self.laser_pool_capacity = interval * laser_length
 
@@ -46,8 +53,8 @@ class TransformerPlanner:
                                                 self.global_plan_callback, queue_size=1)
         self.goal_sub = rospy.Subscriber("/move_base/current_goal", PoseStamped, self.goal_callback, queue_size=1)
         self.cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
-        # 25 HZ
-        rospy.Timer(rospy.Duration(secs=0, nsecs=40000000), self.cmd_inference)
+        # 50 HZ
+        rospy.Timer(rospy.Duration(secs=0, nsecs=20000000), self.cmd_inference)
 
     def laser_callback(self, msg: LaserScan):
         if len(self.laser_pool) > self.laser_pool_capacity:
@@ -70,15 +77,29 @@ class TransformerPlanner:
         assert isinstance(self.goal, PoseStamped)
         delta_x = self.goal.pose.position.x - robot_pose.transform.translation.x
         delta_y = self.goal.pose.position.y - robot_pose.transform.translation.y
-        delta_angle = self._get_yaw(self.goal.pose.orientation) - self._get_yaw(robot_pose.transform.rotation)
-        delta_angle = math.fabs(angles.normalize_angle(delta_angle))
+        # delta_angle = self._get_yaw(self.goal.pose.orientation) - self._get_yaw(robot_pose.transform.rotation)
+        # delta_angle = math.fabs(angles.normalize_angle(delta_angle))
         distance = math.sqrt(delta_x ** 2 + delta_y ** 2)
-        if distance <= 0.8 and delta_angle <= 1.0:
+        if distance <= goal_tolerance:
+            self.cmd_vel_pub.publish(Twist())
+            rospy.logfatal("reach the goal")
+            return True
+        elif distance <= deceleration_tolerance:
+            self.linear_deceleration(1.0,
+                                     deceleration_tolerance - distance,
+                                     deceleration_tolerance - goal_tolerance)
+            rospy.logfatal("close to the target")
             return True
         else:
             return False
 
+    def linear_deceleration(self, v0, x, d):
+        cmd = Twist()
+        cmd.linear.x = math.sqrt((d - x) / d) * v0
+        self.cmd_vel_pub.publish(cmd)
+
     def make_tensor(self):
+        # laser
         lasers = [self.laser_pool[-1] for _ in range(laser_length)]
         for i in range(laser_length - 1, 0, -1):
             prefix = len(self.laser_pool) - i * interval
@@ -86,21 +107,9 @@ class TransformerPlanner:
                 continue
             else:
                 lasers[laser_length - i - 1] = self.laser_pool[prefix]
-        laser_tensor = torch.tensor(lasers, dtype=torch.float).to(self.device)
-        assert isinstance(self.global_plan, Path)
-        global_plan = []
-        for pose in self.global_plan.poses:
-            assert isinstance(pose, PoseStamped)
-            x = pose.pose.position.x
-            y = pose.pose.position.y
-            yaw = self._get_yaw(pose.pose.orientation)
-            global_plan.append((x, y, yaw))
-        global_plan = torch.tensor(global_plan, dtype=torch.float)
-        if len(global_plan) > 0:
-            global_plan = global_plan[:min(len(global_plan), look_ahead_poses * down_sample):down_sample, :]
-        else:
-            global_plan = torch.zeros((look_ahead_poses, 3), dtype=torch.float)
-        global_plan_tensor = global_plan.to(self.device)
+        laser_tensor = torch.tensor(lasers, dtype=torch.float)
+
+        # goal
         goal = tf2_geometry_msgs.PoseStamped()
         goal.pose = self.goal.pose
         goal.header.stamp = rospy.Time(0)
@@ -113,9 +122,32 @@ class TransformerPlanner:
             rospy.logfatal("could not transform goal to the robot frame")
             return
         goal = (target_pose.pose.position.x, target_pose.pose.position.y, self._get_yaw(target_pose.pose.orientation))
-        goal_tensor = torch.tensor(goal, dtype=torch.float).to(self.device)
+        goal_tensor = torch.tensor(goal, dtype=torch.float)
+
+        # global plan
+        assert isinstance(self.global_plan, Path)
+        global_plan = []
+        for pose in self.global_plan.poses:
+            assert isinstance(pose, PoseStamped)
+            x = pose.pose.position.x
+            y = pose.pose.position.y
+            yaw = self._get_yaw(pose.pose.orientation)
+            global_plan.append((x, y, yaw))
+        global_plan = torch.tensor(global_plan, dtype=torch.float)
+        if len(global_plan) > 0:
+            global_plan = global_plan[:min(len(global_plan), look_ahead_poses * down_sample):down_sample, :]
+            if len(global_plan) < look_ahead_poses:
+                padding = repeat(goal_tensor, "d -> b d", b=look_ahead_poses - len(global_plan))
+                global_plan = torch.concat([global_plan, padding])
+        else:
+            global_plan = repeat(goal_tensor, "d -> b d", b=look_ahead_poses)
+        global_plan_tensor = global_plan
+
+        # laser mask
         laser_mask = torch.ones((laser_length, laser_length), dtype=torch.bool).triu(1)
         laser_mask = torch.stack([laser_mask for _ in range(torch.cuda.device_count())]).to(self.device)
+
+        # unsqueeze
         laser_tensor = torch.unsqueeze(laser_tensor, 0).to(self.device)
         global_plan_tensor = torch.unsqueeze(global_plan_tensor, 0).to(self.device)
         goal_tensor = torch.unsqueeze(goal_tensor, 0).to(self.device)
@@ -125,7 +157,16 @@ class TransformerPlanner:
         if self.goal is None or self.is_done():
             return
         cmd_vel = Twist()
-        laser_tensor, global_plan_tensor, goal_tensor, laser_mask = self.make_tensor()
+        while True:
+            if self.global_plan is not None and len(self.laser_pool) > 0:
+                break
+            else:
+                rospy.sleep(0.5)
+        tensor = self.make_tensor()
+        if tensor is None:
+            return
+        else:
+            laser_tensor, global_plan_tensor, goal_tensor, laser_mask = tensor
         self.model.train(False)
         with torch.no_grad():
             predict = self.model(laser_tensor, global_plan_tensor, goal_tensor, laser_mask)
