@@ -26,6 +26,7 @@ look_ahead_poses = 20
 
 goal_tolerance = 0.3
 deceleration_tolerance = 1.0
+robot_frame = "base_footprint"
 
 
 class TransformerPlanner:
@@ -48,11 +49,12 @@ class TransformerPlanner:
         self.laser_pool = []
         self.laser_pool_capacity = interval * laser_length
 
-        self.scan_sub = rospy.Subscriber("/scan", LaserScan, self.laser_callback, queue_size=1)
+        self.scan_sub = rospy.Subscriber("/map_scan", LaserScan, self.laser_callback, queue_size=1)
         self.global_plan_sub = rospy.Subscriber("/move_base/GlobalPlanner/robot_frame_plan", Path,
                                                 self.global_plan_callback, queue_size=1)
         self.goal_sub = rospy.Subscriber("/move_base/current_goal", PoseStamped, self.goal_callback, queue_size=1)
-        self.cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+        self.cmd_vel_pub = rospy.Publisher("/vm_gsd601/gr_canopen_vm_motor/mobile_base_controller/cmd_vel", Twist,
+                                           queue_size=1)
         # 25 HZ
         rospy.Timer(rospy.Duration(secs=0, nsecs=40000000), self.cmd_inference)
 
@@ -76,7 +78,7 @@ class TransformerPlanner:
 
     def is_done(self):
         try:
-            robot_pose = self.tf_buffer.lookup_transform("map", "base_link", rospy.Time(0))
+            robot_pose = self.tf_buffer.lookup_transform("map", robot_frame, rospy.Time(0))
             assert isinstance(robot_pose, TransformStamped)
         except tf2_ros.TransformException:
             rospy.logfatal("could not get robot pose")
@@ -123,7 +125,7 @@ class TransformerPlanner:
         goal.header.stamp = rospy.Time(0)
         goal.header.frame_id = "map"
         try:
-            target_pose = self.tf_buffer.transform(goal, "base_link")
+            target_pose = self.tf_buffer.transform(goal, robot_frame)
             assert isinstance(target_pose, PoseStamped)
         except tf2_ros.TransformException as ex:
             rospy.logfatal(ex)
