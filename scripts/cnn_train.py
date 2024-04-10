@@ -15,8 +15,8 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
 linux_user = os.getlogin()
-train_dataset_root = f"/home/{linux_user}/Downloads/pretraining_dataset"
-eval_dataset_root = f"/home/{linux_user}/Downloads/pretraining_dataset_eval"
+train_dataset_root = f"/home/{linux_user}/Downloads/navigation_pretraining_dataset/pretraining_dataset/office"
+eval_dataset_root = f"/home/{linux_user}/Downloads/navigation_pretraining_dataset/pretraining_dataset/office"
 
 ignore_init_step_num = 0
 ignore_end_step_num = 0
@@ -72,6 +72,7 @@ def load_data(mode, batch_size):
     return DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True, num_workers=24)
 
 
+
 class VelocityCmdLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -118,6 +119,7 @@ class DeepMotionPlannerTrainner:
         divide = torch.divide(squeeze, torch.tensor(len(predicts), dtype=torch.float))
         return divide[0].item(), divide[1].item()
 
+
     def train(self, num):
         self.model.train(True)
         epoch_loss = torch.tensor(0.0, dtype=torch.float)
@@ -125,7 +127,7 @@ class DeepMotionPlannerTrainner:
         with tqdm(total=len(self.train_data_loader), desc=f"training_epoch{num}") as pbar:
             for j, (data, cmd_vel) in enumerate(self.train_data_loader):
                 cmd_vel = cmd_vel.to(self.device)
-                data = torch.reshape(data, (-1, 1, 903))
+                data = torch.reshape(data, (-1, 1, 1083))
                 predict = self.model(data)
                 loss = self.loss_fn(predict, cmd_vel)
 
@@ -154,7 +156,7 @@ class DeepMotionPlannerTrainner:
         with torch.no_grad and tqdm(total=len(self.eval_data_loader), desc=f"evaluating_epoch{num}") as pbar:
             for j, (data, cmd_vel) in enumerate(self.eval_data_loader):
                 cmd_vel = cmd_vel.to(self.device)
-                data = torch.reshape(data, (-1, 1, 903))
+                data = torch.reshape(data, (-1, 1, 1083))
                 predict = self.model(data)
                 loss = self.loss_fn(predict, cmd_vel)
                 pbar.update(len(data))
