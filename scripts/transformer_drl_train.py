@@ -1,3 +1,5 @@
+# not finish yet
+
 # utils
 import math
 import os
@@ -58,7 +60,7 @@ class SimpleEnv(gym.Env):
         self.action_space = spaces.Box(low=np.array([0.0, -1.0]), high=np.array([1.0, 1.0]), shape=(2,), dtype=float)
         self.observation_space = spaces.Dict({
             "laser": spaces.Box(low=0.0, high=1.0, shape=(900,), dtype=float),
-            "global_plan": spaces.Box(low=0.0, high=100, shape=(20,3), dtype=float),
+            "global_plan": spaces.Box(low=0.0, high=100, shape=(20, 3), dtype=float),
             "goal": spaces.Box(low=-1, high=1, shape=(3,), dtype=float)
         })
 

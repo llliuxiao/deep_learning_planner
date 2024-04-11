@@ -1,3 +1,5 @@
+# This is a script to map high-resolution lidar data to 0.25deg
+
 import rospy
 from sensor_msgs.msg import LaserScan
 import numpy as np
@@ -47,6 +49,6 @@ def laser_callback(msg: LaserScan):
 
 if __name__ == "__main__":
     rospy.init_node("map_scan")
-    laser_sub = rospy.Subscriber("/robot7/scan", LaserScan, laser_callback, queue_size=1)
+    laser_sub = rospy.Subscriber("/robot4/scan", LaserScan, laser_callback, queue_size=1)
     laser_pub = rospy.Publisher("/map_scan", LaserScan, queue_size=1)
     rospy.spin()
