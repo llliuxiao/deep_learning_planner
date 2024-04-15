@@ -210,5 +210,12 @@ class TransformerPlanner:
 
 if __name__ == "__main__":
     rospy.init_node("transformer_planner")
-    planner = TransformerPlanner()
+    planner = TransformerPlanner(
+        robot_frame="base_link",
+        scan_topic_name="/scan",
+        global_topic_name="/move_base/GlobalPlanner/robot_frame_plan",
+        goal_topic_name="/move_base/current_goal",
+        cmd_topic_name="/cmd_vel"
+    )
+    # planner = TransformerPlanner()
     rospy.spin()
