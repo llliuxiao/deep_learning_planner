@@ -16,7 +16,7 @@ from sensor_msgs.msg import LaserScan
 import tf2_geometry_msgs
 from tf.transformations import euler_from_quaternion
 
-model_file = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/logs/model/best.pth"
+model_file = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/logs/model/best.pth"
 
 
 class CNNPlanner:

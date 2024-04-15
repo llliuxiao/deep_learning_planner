@@ -21,7 +21,7 @@ eval_dataset_root = f"/home/{linux_user}/Downloads/navigation_pretraining_datase
 ignore_init_step_num = 0
 ignore_end_step_num = 0
 subsample_interval = 1
-save_root = f"/home/{linux_user}/isaac_sim_ws/src/supervised_learning_planner/logs"
+save_root = f"/home/{linux_user}/isaac_sim_ws/src/deep_learning_planner/logs"
 index = 0
 while True:
     if os.path.exists(f"{save_root}/model{index}"):

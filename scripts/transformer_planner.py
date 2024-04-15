@@ -22,7 +22,7 @@ from tf2_ros.transform_listener import TransformListener
 from transformer_network import RobotTransformer
 
 # some const variable, must match with config in training, do not modify it randomly
-model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/supervised_learning_planner/transformer_logs/model/best.pth"
+model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model/best.pth"
 laser_length = 6
 interval = 10
 down_sample = 4

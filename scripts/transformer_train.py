@@ -14,7 +14,7 @@ from data import load_data
 from transformer_network import RobotTransformer
 
 linux_user = os.getlogin()
-save_root = f"/home/{linux_user}/isaac_sim_ws/src/supervised_learning_planner/transformer_logs"
+save_root = f"/home/{linux_user}/isaac_sim_ws/src/deep_learning_planner/transformer_logs"
 index = 0
 while True:
     if os.path.exists(f"{save_root}/model{index}"):
@@ -163,7 +163,7 @@ class Trainner:
             torch.save(checkpoint, f"{model_save_dir}/best.pth")
 
 
-# best_model = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/transformer_logs/model1/best.pth"
+# best_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model1/best.pth"
 if __name__ == "__main__":
     planner = Trainner()
     # planner.resume_checkpoint(best_model)

@@ -268,7 +268,7 @@ class SimpleEnv(gym.Env):
 
 
 def load_network_parameters(net_model):
-    file = "/home/gr-agv-lx91/isaac_sim_ws/src/supervised_learning_planner/logs/model3/best.pth"
+    file = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/logs/model3/best.pth"
     param = torch.load(file)["model_state_dict"]
     feature_extractor_param = {}
     mlp_extractor_param = {}
