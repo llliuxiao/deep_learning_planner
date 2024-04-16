@@ -1,12 +1,10 @@
+from typing import Optional, Callable, Tuple
+import math
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum, Tensor
-
-from typing import List, Optional, Callable, Tuple
 from beartype import beartype
-
-from einops import pack, unpack, repeat, reduce, rearrange
-from einops.layers.torch import Rearrange, Reduce
+from einops import reduce, rearrange
+from torch import nn, einsum
 
 
 def exists(val):
@@ -25,6 +23,27 @@ class LayerNorm(nn.Module):
 
     def forward(self, x):
         return F.layer_norm(x, x.shape[-1:], self.gamma, self.beta)
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_seq_len=20):
+        super().__init__()
+
+        # Compute the positional encoding once
+        pos_enc = torch.zeros(max_seq_len, d_model)
+        pos = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pos_enc[:, 0::2] = torch.sin(pos * div_term)
+        pos_enc[:, 1::2] = torch.cos(pos * div_term)
+        pos_enc = pos_enc.unsqueeze(0)
+
+        # Register the positional encoding as a buffer to avoid it being
+        # considered a parameter when saving the model
+        self.register_buffer('pos_enc', pos_enc)
+
+    def forward(self, x):
+        x = x + self.pos_enc[:, :x.size(1), :]
+        return x
 
 
 class FeedForward(nn.Module):
@@ -104,6 +123,7 @@ class TransformerAttention(nn.Module):
             # adaptive layer-norm
             x = cond_fn(x)
 
+        # noinspection PyTupleAssignmentBalance
         q, k, v = self.to_q(x), *self.to_kv(kv_input).chunk(2, dim=-1)
 
         q = rearrange(q, 'b n (h d) -> b h n d', h=self.heads)
@@ -174,34 +194,38 @@ class RobotTransformer(nn.Module):
     def __init__(self, frame=6):
         super().__init__()
         self.frame = frame
-        self.laser_pre = nn.Sequential(
-            # nn.AvgPool1d(kernel_size=3, stride=3),
-            nn.Linear(1080, 512)
-        )
+        # self.laser_pre = nn.Sequential(
+        #     # nn.AvgPool1d(kernel_size=3, stride=3),
+        #     nn.Linear(1080, 512)
+        # )
         self.global_plan_pre = nn.Linear(3, 256)
-        self.laser_transformer = Transformer(dim=512, dim_head=64,
-                                             heads=8, depth=6,
-                                             attn_dropout=0.1, ff_dropout=0.1)
+        # self.laser_transformer = Transformer(dim=512, dim_head=64,
+        #                                      heads=8, depth=6,
+        #                                      attn_dropout=0.1, ff_dropout=0.1)
+        self.position_encoding = PositionalEncoding(d_model=256, max_seq_len=20)
         self.global_plan_transformer = Transformer(dim=256, dim_head=64,
                                                    heads=4, depth=4,
                                                    attn_dropout=0.1, ff_dropout=0.1)
         self.dense = nn.Sequential(
-            nn.Linear(512 + 256 + 3, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 2)
+            nn.Linear(256 + 3, 512), nn.ReLU(),
         )
+        self.mlp_extractor_actor = nn.Sequential(nn.Linear(512, 256), nn.ReLU())
+        self.mlp_extractor_critic = nn.Sequential(nn.Linear(512, 128), nn.ReLU())
+        self.action_net = nn.Sequential(nn.Linear(256, 2), nn.Softplus())
+        self.value_net = nn.Sequential(nn.Linear(128, 1))
 
     def forward(self, laser, global_plan, goal, laser_mask):
-        pooled_laser = self.laser_pre(laser)
+        # pooled_laser = self.laser_pre(laser)
         high_dim_global_plan = self.global_plan_pre(global_plan)
 
         laser_mask = torch.squeeze(laser_mask)
-        attended_laser = self.laser_transformer(pooled_laser, attn_mask=laser_mask)
-        attended_global_plan = self.global_plan_transformer(high_dim_global_plan)
+        # attended_laser = self.laser_transformer(pooled_laser, attn_mask=laser_mask)
+        position_encoding = self.position_encoding(high_dim_global_plan)
+        attended_global_plan = self.global_plan_transformer(position_encoding)
 
-        laser_token = reduce(attended_laser, 'b f d -> b d', 'mean')
+        # laser_token = reduce(attended_laser, 'b f d -> b d', 'mean')
         global_plan_token = reduce(attended_global_plan, 'b f d -> b d', 'mean')
 
-        tensor = torch.concat((laser_token, global_plan_token, goal), dim=1)
-        output = self.dense(tensor)
-        return output
+        tensor = torch.concat((global_plan_token, goal), dim=1)
+        feature = self.dense(tensor)
+        return self.action_net(self.mlp_extractor_actor(feature))

@@ -1,4 +1,5 @@
 from transformer_planner import TransformerPlanner
+from parameters import *
 
 import rospy
 from geometry_msgs.msg import Twist, PoseStamped
@@ -7,9 +8,6 @@ import torch
 
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 import actionlib
-
-goal_tolerance = 0.3
-deceleration_tolerance = 1.0
 
 
 class TransformerPlanner006(TransformerPlanner):
@@ -44,7 +42,7 @@ class TransformerPlanner006(TransformerPlanner):
         cmd_vel.angular.z = self.velocity_factor * predict[1].item()
         distance = self.get_distance_to_goal()
         assert isinstance(self.global_plan, Path)
-        if distance <= goal_tolerance and len(self.global_plan.poses) < 10:
+        if distance <= goal_radius and len(self.global_plan.poses) < 10:
             self.goal_reached = True
             self.goal = None
             self.cmd_vel_pub.publish(Twist())
@@ -53,7 +51,7 @@ class TransformerPlanner006(TransformerPlanner):
         elif distance <= deceleration_tolerance and len(self.global_plan.poses) < 10:
             linear = self.linear_deceleration(1.0 * self.velocity_factor,
                                               deceleration_tolerance - distance,
-                                              deceleration_tolerance - goal_tolerance)
+                                              deceleration_tolerance - goal_radius)
             cmd_vel.angular.z = linear / cmd_vel.linear.x * cmd_vel.angular.z
             cmd_vel.linear.x = linear
             self.cmd_vel_pub.publish(cmd_vel)

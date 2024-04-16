@@ -5,18 +5,13 @@ import numpy as np
 import pandas as pd
 import torch
 from einops import repeat
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
+from parameters import *
 
 dataset_root = "/home/gr-agv-lx91/Downloads/pretraining_dataset"
 scenes = ["hospital", "office"]
 train_dataset_info_path = os.path.join(dataset_root, "train_dataset.csv")
 eval_dataset_info_path = os.path.join(dataset_root, "eval_dataset.csv")
-
-laser_length = 6
-interval = 10
-down_sample = 4
-look_ahead_poses = 20
 
 
 class RobotTransformerDataset(Dataset):
@@ -69,7 +64,9 @@ class RobotTransformerDataset(Dataset):
 
     def __getitem__(self, item):
         meta_data = self.data_info[item]
+        scale = torch.tensor([look_ahead_distance, look_ahead_distance, torch.pi], dtype=torch.float)
         goal = torch.tensor(meta_data.goal, dtype=torch.float)
+        goal = torch.div(goal, scale)
         cmd_vel = torch.tensor(meta_data.cmd_vel, dtype=torch.float)
         global_plan = torch.from_numpy(np.load(meta_data.global_plan_path)).float()
         if len(global_plan) > 0:
@@ -79,7 +76,8 @@ class RobotTransformerDataset(Dataset):
                 global_plan = torch.concat([global_plan, padding])
         else:
             global_plan = repeat(goal, "d -> b d", b=look_ahead_poses)
-        laser = np.array([np.load(path) for path in meta_data.laser_path])
+        global_plan = torch.div(global_plan, scale)
+        laser = np.array([np.load(path) for path in meta_data.laser_path]) / laser_range
         laser = torch.tensor(laser, dtype=torch.float)
         return laser, global_plan, goal, cmd_vel
 

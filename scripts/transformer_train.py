@@ -12,6 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from data import load_data
 from transformer_network import RobotTransformer
+from parameters import *
 
 linux_user = os.getlogin()
 save_root = f"/home/{linux_user}/isaac_sim_ws/src/deep_learning_planner/transformer_logs"
@@ -28,12 +29,15 @@ while True:
 
 
 class VelocityCmdLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, device=torch.device("cuda")):
         super().__init__()
+        self.coefficient = torch.tensor([max_vel_x - min_vel_x, max_vel_z - min_vel_z], dtype=torch.float).to(device)
+        self.intercept = torch.tensor([min_vel_x, min_vel_z], dtype=torch.float).to(device)
 
-    # noinspection PyMethodMayBeStatic
     def forward(self, inputs, targets):
-        sub = torch.sub(targets, inputs)
+        coefficient = torch.mul(inputs, self.coefficient)
+        intercept = torch.add(coefficient, self.intercept)
+        sub = torch.sub(targets, intercept)
         pow = torch.pow(sub, 2)
         sum = torch.sum(pow, dim=1)
         sqrt = torch.sqrt(sum)
@@ -41,7 +45,7 @@ class VelocityCmdLoss(nn.Module):
 
 
 class Trainner:
-    def __init__(self, batch_size=128, lr=1e-5, device=torch.device("cuda"), frame=6):
+    def __init__(self, batch_size=256, lr=1e-5, device=torch.device("cuda"), frame=6):
         self.frame = frame
         self.lr = lr
         self.batch_size = batch_size
@@ -62,6 +66,9 @@ class Trainner:
         self.training_total_step = 0
         self.eval_total_step = 0
 
+        self.coefficient = torch.tensor([max_vel_x - min_vel_x, max_vel_z - min_vel_z], dtype=torch.float).to(device)
+        self.intercept = torch.tensor([min_vel_x, min_vel_z], dtype=torch.float).to(device)
+
         self.best_loss = math.inf
         torch.manual_seed(1)
         print(self.model)
@@ -75,7 +82,10 @@ class Trainner:
         self.lr_decay.last_epoch = start_epoch
 
     def get_single_loss(self, predicts, targets):
-        sub = torch.sub(targets, predicts)
+        coefficient = torch.mul(predicts, self.coefficient)
+        intercept = torch.add(coefficient, self.intercept)
+
+        sub = torch.sub(targets, intercept)
         fabs = torch.abs(sub)
         sum = torch.sum(fabs, dim=0)
         squeeze = torch.squeeze(sum)
@@ -114,7 +124,7 @@ class Trainner:
                     linear, angular = self.get_single_loss(predict, cmd_vel)
                     self.train_summary_writer.add_scalar("training_linear_loss", linear, self.training_total_step)
                     self.train_summary_writer.add_scalar("training_angular_loss", angular, self.training_total_step)
-        self.train_summary_writer.add_scalar("learning_rate", self.lr_decay.get_lr()[0], num)
+        self.train_summary_writer.add_scalar("learning_rate", self.lr_decay.get_last_lr()[0], num)
         self.train_summary_writer.add_scalar("epoch_loss", epoch_loss.item() / epoch_steps, num)
 
     def eval(self, num):
@@ -143,6 +153,7 @@ class Trainner:
                         self.eval_summary_writer.add_scalar("step_loss", loss.item(), self.eval_total_step)
         self.eval_summary_writer.add_scalar("epoch_loss", epoch_loss.item() / epoch_steps, num)
         self.save_best_model(epoch_loss.item() / epoch_steps, num)
+        return epoch_loss.item() / epoch_steps
 
     def save_checkpoint(self, num):
         checkpoint = {
@@ -167,10 +178,12 @@ class Trainner:
 if __name__ == "__main__":
     planner = Trainner()
     # planner.resume_checkpoint(best_model)
-    epoch = 200
+    epoch = 250
     for i in range(epoch):
         planner.train(i)
-        planner.eval(i)
+        eval_loss = planner.eval(i)
+        if eval_loss <= 0.05:
+            break
         # planner.save_checkpoint(i)
         if i > 0 and i % 5 == 0:
             planner.lr_decay.step()

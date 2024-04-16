@@ -3,3 +3,4 @@ logs/runs
 logs/model[0-9]*
 transformer_logs/runs
 transformer_logs/model[0-9]*
+transformer_logs/training_logs.txt

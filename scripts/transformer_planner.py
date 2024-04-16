@@ -20,21 +20,14 @@ from tf2_ros import Buffer
 from tf2_ros.transform_listener import TransformListener
 
 from transformer_network import RobotTransformer
+from parameters import *
 
-# some const variable, must match with config in training, do not modify it randomly
-model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model/best.pth"
-laser_length = 6
-interval = 10
-down_sample = 4
-look_ahead_poses = 20
-
-goal_tolerance = 0.3
-deceleration_tolerance = 1.0
+model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model5/best.pth"
 
 
 class TransformerPlanner:
     def __init__(self,
-                 velocity_factor=0.8,
+                 velocity_factor=1.0,
                  robot_frame="base_footprint",
                  scan_topic_name="/map_scan",
                  global_topic_name="/robot4/move_base/GlobalPlanner/robot_frame_plan",
@@ -115,8 +108,10 @@ class TransformerPlanner:
             else:
                 lasers[laser_length - i - 1] = self.laser_pool[prefix]
         laser_tensor = torch.tensor(lasers, dtype=torch.float)
+        laser_tensor = torch.div(laser_tensor, torch.tensor(laser_range, dtype=torch.float))
 
         # goal
+        scale = torch.tensor([look_ahead_distance, look_ahead_distance, torch.pi], dtype=torch.float)
         goal = tf2_geometry_msgs.PoseStamped()
         goal.pose = self.goal.pose
         goal.header.stamp = rospy.Time(0)
@@ -130,6 +125,7 @@ class TransformerPlanner:
             return
         goal = (target_pose.pose.position.x, target_pose.pose.position.y, self._get_yaw(target_pose.pose.orientation))
         goal_tensor = torch.tensor(goal, dtype=torch.float)
+        goal_tensor = torch.div(goal_tensor, scale)
 
         # global plan
         assert isinstance(self.global_plan, Path)
@@ -148,7 +144,7 @@ class TransformerPlanner:
                 global_plan = torch.concat([global_plan, padding])
         else:
             global_plan = repeat(goal_tensor, "d -> b d", b=look_ahead_poses)
-        global_plan_tensor = global_plan
+        global_plan_tensor = torch.div(global_plan, scale)
 
         # laser mask
         laser_mask = torch.ones((laser_length, laser_length), dtype=torch.bool).triu(1)
@@ -181,11 +177,11 @@ class TransformerPlanner:
         with torch.no_grad():
             predict = self.model(laser_tensor, global_plan_tensor, goal_tensor, laser_mask)
         predict = torch.squeeze(predict)
-        cmd_vel.linear.x = self.velocity_factor * predict[0].item()
-        cmd_vel.angular.z = self.velocity_factor * predict[1].item()
+        cmd_vel.linear.x = self.velocity_factor * predict[0].item() * (max_vel_x - min_vel_x) + min_vel_x
+        cmd_vel.angular.z = self.velocity_factor * predict[1].item() * (max_vel_z - min_vel_z) + min_vel_z
         distance = self.get_distance_to_goal()
         assert isinstance(self.global_plan, Path)
-        if distance <= goal_tolerance and len(self.global_plan.poses) < 10:
+        if distance <= goal_radius and len(self.global_plan.poses) < 10:
             self.goal_reached = True
             self.goal = None
             self.cmd_vel_pub.publish(Twist())
@@ -193,7 +189,7 @@ class TransformerPlanner:
         elif distance <= deceleration_tolerance and len(self.global_plan.poses) < 10:
             linear = self.linear_deceleration(1.0 * self.velocity_factor,
                                               deceleration_tolerance - distance,
-                                              deceleration_tolerance - goal_tolerance)
+                                              deceleration_tolerance - goal_radius)
             cmd_vel.angular.z = linear / cmd_vel.linear.x * cmd_vel.angular.z
             cmd_vel.linear.x = linear
             self.cmd_vel_pub.publish(cmd_vel)

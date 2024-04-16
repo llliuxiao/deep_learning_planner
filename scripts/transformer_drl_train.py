@@ -4,6 +4,7 @@
 import math
 import os
 import re
+import enum
 
 # gym
 import gymnasium as gym
@@ -29,21 +30,19 @@ from std_srvs.srv import Empty
 from transformer_network import RobotTransformer
 from pose_utils import PoseUtils, get_yaw
 import tqdm
+from parameters import *
 
-# robot parameters:
-max_vel = 1.0
-min_vel = 0.0
-max_ang = 1.0
-min_ang = -1.0
-robot_radius = 0.45
-goal_radius = 0.5
-max_trapped_time = 5.0
-
-max_iteration = 1024
-
-save_log_dir = f"/home/{os.getlogin()}/isaac_sim_ws/src/reinforcement_learning_planner/logs/runs"
+save_log_dir = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs"
+pretrained_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/logs/model/best.pth"
 if not os.path.exists(save_log_dir):
     os.makedirs(save_log_dir)
+
+
+class TrainingState(enum.Enum):
+    REACHED = 0,
+    COLLISION = 1,
+    TRUNCATED = 2,
+    TRAINING = 4
 
 
 class SimpleEnv(gym.Env):
@@ -54,14 +53,15 @@ class SimpleEnv(gym.Env):
         # const
         self.robot_frame = "base_link"
         self.map_frame = "map"
+        self.laser_pool_capacity = interval * laser_length
 
         # global variable
         self.num_envs = 1
-        self.action_space = spaces.Box(low=np.array([0.0, -1.0]), high=np.array([1.0, 1.0]), shape=(2,), dtype=float)
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=float)
         self.observation_space = spaces.Dict({
-            "laser": spaces.Box(low=0.0, high=1.0, shape=(900,), dtype=float),
-            "global_plan": spaces.Box(low=0.0, high=100, shape=(20, 3), dtype=float),
-            "goal": spaces.Box(low=-1, high=1, shape=(3,), dtype=float)
+            "laser": spaces.Box(low=0., high=1.0, shape=(6, 1080), dtype=float),
+            "global_plan": spaces.Box(low=-1., high=1., shape=(20, 3), dtype=float),
+            "goal": spaces.Box(low=-math.inf, high=math.inf, shape=(3,), dtype=float)
         })
 
         # utils
@@ -70,9 +70,8 @@ class SimpleEnv(gym.Env):
         # private variable
         self.global_plan = Path()
         self.map = OccupancyGrid()
-        self.laser = LaserScan()
-        self.terminated = False
-        self.truncated = False
+        self.laser_pool = []
+        self.training_state = TrainingState.TRAINING
         self.num_iterations = 0
         self.target = PoseStamped()
         self.collision_times = 0
@@ -100,10 +99,10 @@ class SimpleEnv(gym.Env):
         self._take_action(action)
         observations = self._get_observation()
         self._pause()
-        done = self._is_done()
+        state = self._is_done()
         reward = self._get_reward(action)
-        terminated, truncated = self._get_done()
-        return observations, reward, terminated, truncated, {}
+        return (observations, reward, state == TrainingState.REACHED,
+                state == TrainingState.COLLISION or state == TrainingState.TRUNCATED, {})
 
     def reset(self, **kwargs):
         rospy.loginfo("resetting!")
@@ -137,8 +136,7 @@ class SimpleEnv(gym.Env):
         rospy.sleep(3.0)
 
         # reset variables
-        self.terminated = False
-        self.truncated = False
+        self.training_state = TrainingState.TRAINING
         self.num_iterations = 0
         self.collision_times = 0
         self.pbar.reset()
@@ -163,47 +161,58 @@ class SimpleEnv(gym.Env):
             else:
                 break
 
-    # to reinforce works by ETH in 2017, only laser and target pose are required
     def _get_observation(self):
         pose = self._pose_utils.transform_pose(self.target, self.robot_frame)
         assert isinstance(pose, PoseStamped)
-        pos = (pose.pose.position.x, pose.pose.position.y, get_yaw(pose.pose.orientation))
-        obs = {"laser": np.array(self.laser.ranges) / 10.0, "goal": np.array(pos) / np.array((10.0, 10.0, math.pi))}
-        return obs
+        pos = np.array((pose.pose.position.x, pose.pose.position.y, get_yaw(pose.pose.orientation)))
+        assert isinstance(self.global_plan, Path)
+        global_plan = []
+        for pose in self.global_plan.poses:
+            assert isinstance(pose, PoseStamped)
+            x = pose.pose.position.x
+            y = pose.pose.position.y
+            yaw = get_yaw(pose.pose.orientation)
+            global_plan.append((x, y, yaw))
+        global_plan = np.array(global_plan)
+        if len(global_plan) > 0:
+            global_plan = global_plan[:min(len(global_plan), look_ahead_poses * down_sample):down_sample, :]
+            if len(global_plan) < look_ahead_poses:
+                padding = np.stack([pos for _ in range(look_ahead_poses - len(global_plan))], axis=0)
+                global_plan = torch.concat([global_plan, padding])
+        else:
+            global_plan = np.stack([pos for _ in range(look_ahead_poses)], axis=0)
+        global_plan = global_plan / np.array([look_ahead_distance, look_ahead_distance, np.pi])
+        pos = pos / np.array([look_ahead_distance, look_ahead_distance, np.pi])
+        return {
+            "laser": np.random.rand(6, 1080),
+            "global_plan": global_plan,
+            "goal": pos
+        }
 
     def _get_reward(self, action):
         reward = 0
-        r_arrival = 50
+        linear = action[0] * (max_vel_x - min_vel_x) + min_vel_x
+        angular = action[1] * (max_vel_z - min_vel_z) + min_vel_z
 
-        # reach or collision
-        if self.terminated:
-            reward += r_arrival
-        elif self.truncated and self.num_iterations >= max_iteration:
-            reward += 10
+        if self.training_state == TrainingState.REACHED:
+            reward += goal_reached_reward
 
-        # close to target
-
-        # angular velocity
-        if abs(action[1]) > 0.7:
-            reward -= abs(action[1]) * 0.2
-
-        # collision
-        if self.truncated and self.num_iterations < max_iteration:
-            reward -= r_arrival
+        if self.training_state == TrainingState.COLLISION:
+            reward += collision_punish
         else:
-            min_dist = min(self.laser.ranges)
-            if min_dist <= 3 * robot_radius:
-                reward -= (3 * robot_radius - min_dist) * 0.2
+            min_obstacle_distance = min(self.laser_pool[-1].ranges)
+            if min_obstacle_distance < 2 * robot_radius:
+                reward -= (2 * robot_radius - min_obstacle_distance) * obstacle_punish_weight
+
+        reward += linear * velocity_reward_weight
+        reward -= angular * angular_punish_weight
 
         return reward
 
-    def _get_done(self):
-        return self.terminated, self.truncated
-
     def _take_action(self, action):
         cmd_vel = Twist()
-        cmd_vel.linear.x = action[0]
-        cmd_vel.angular.z = action[1]
+        cmd_vel.linear.x = action[0] * (max_vel_x - min_vel_x) + min_vel_x
+        cmd_vel.angular.z = action[1] * (max_vel_z - min_vel_z) + min_vel_z
         self._cmd_vel_pub.publish(cmd_vel)
         rospy.sleep(0.05)
 
@@ -219,13 +228,13 @@ class SimpleEnv(gym.Env):
             ])
         )
         if dist_to_goal <= goal_radius:
-            self.terminated = True
+            self.training_state = TrainingState.REACHED
             self._cmd_vel_pub.publish(Twist())
             rospy.logfatal("Carter reached the goal!")
-            return True
+            return self.training_state
 
         # 2) Robot Trapped?
-        laser_ranges = np.array(self.laser.ranges)
+        laser_ranges = np.array(self.laser_pool[-1].ranges)
         collision_points = np.where(laser_ranges <= robot_radius)[0]
         if len(collision_points) > 50:
             self.collision_times += 1
@@ -233,26 +242,28 @@ class SimpleEnv(gym.Env):
         else:
             self.collision_times = 0
         if self.collision_times > 10:
-            self.truncated = True
+            self.training_state = TrainingState.COLLISION
             self._cmd_vel_pub.publish(Twist())
             rospy.logfatal("Collision")
-            return True
+            return self.training_state
 
         # 3) maximum number of iterations?
         self.num_iterations += 1
         if self.num_iterations > max_iteration:
-            self.truncated = True
+            self.training_state = TrainingState.TRUNCATED
             self._cmd_vel_pub.publish(Twist())
             rospy.logfatal("Over the max iteration before going to the goal")
-            return True
-        return False
+            return self.training_state
+        return self.training_state
 
     # Callbacks
     def _map_callback(self, map_msg: OccupancyGrid):
         self.map = map_msg
 
     def _laser_callback(self, laser_msg: LaserScan):
-        self.laser = laser_msg
+        if len(self.laser_pool) > self.laser_pool_capacity:
+            self.laser_pool.pop(0)
+            self.laser_pool.append(laser_msg.ranges)
 
     def _path_callback(self, global_path_msg):
         self.global_plan = global_path_msg
@@ -268,8 +279,7 @@ class SimpleEnv(gym.Env):
 
 
 def load_network_parameters(net_model):
-    file = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/logs/model3/best.pth"
-    param = torch.load(file)["model_state_dict"]
+    param = torch.load(pretrained_model)["model_state_dict"]
     feature_extractor_param = {}
     mlp_extractor_param = {}
     value_net_param = {}
@@ -281,15 +291,17 @@ def load_network_parameters(net_model):
         elif re.search("^module.value_net.", k):
             new_k = k.replace("module.value_net.", "")
             value_net_param[new_k] = v
-        elif re.search("^module.actor.", k):
-            new_k = k.replace("module.actor.", "policy_net.")
+        elif re.search("^module.mlp_extractor_actor.", k):
+            new_k = k.replace("module.mlp_extractor_actor.", "policy_net.")
             mlp_extractor_param[new_k] = v
-        elif re.search("^module.critic.", k):
-            new_k = k.replace("module.critic.", "value_net.")
+        elif re.search("^module.mlp_extractor_critic.", k):
+            new_k = k.replace("module.mlp_extractor_critic.", "value_net.")
             mlp_extractor_param[new_k] = v
         elif re.search("^module.", k):
             new_k = k.replace("module.", "")
             feature_extractor_param[new_k] = v
+    # do not update parameter in feature extractor
+    net_model.features_extractor.requires_grad_(False)
     net_model.action_net.load_state_dict(action_net_param)
     net_model.value_net.load_state_dict(value_net_param)
     net_model.features_extractor.load_state_dict(feature_extractor_param)
@@ -337,14 +349,14 @@ if __name__ == "__main__":
     env = Monitor(SimpleEnv(), save_log_dir)
     policy_kwargs = dict(
         features_extractor_class=RobotTransformer,
-        features_extractor_kwargs=dict(features_dim=1024),
-        net_arch=dict(pi=[512], vf=[256])
+        features_extractor_kwargs=dict(features_dim=512),
+        net_arch=dict(pi=[256], vf=[128])
     )
     model = PPO("MultiInputPolicy",  # ?
                 env=env,
                 verbose=2,  # similar to log level
-                learning_rate=5e-5,
-                batch_size=256,
+                learning_rate=5e-6,
+                batch_size=512,
                 tensorboard_log=save_log_dir,
                 n_epochs=10,  # run n_epochs after collecting a roll-out buffer to optimize parameters
                 n_steps=max_iteration,  # the size of roll-out buffer
