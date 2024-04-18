@@ -3,7 +3,7 @@ max_vel_x = 1.0
 min_vel_x = 0.0
 max_vel_z = 1.0
 min_vel_z = -1.0
-robot_radius = 0.45
+robot_radius = 0.5
 
 # laser
 laser_length = 6

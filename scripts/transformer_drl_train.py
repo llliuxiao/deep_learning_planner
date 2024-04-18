@@ -3,6 +3,8 @@ import math
 import os
 import re
 import enum
+
+import angles
 import numpy as np
 import tqdm
 
@@ -80,6 +82,8 @@ class SimpleEnv(gym.Env):
         self.target = PoseStamped()
         self.collision_times = 0
         self.pbar = tqdm.tqdm(total=max_iteration)
+        self.last_pose = None
+        self.robot_trapped = 0
 
         # ros
         self._plan_sub = rospy.Subscriber("/move_base/GlobalPlanner/robot_frame_plan",
@@ -143,9 +147,11 @@ class SimpleEnv(gym.Env):
         rospy.sleep(3.0)
 
         # reset variables
+        self.last_pose = init_pose_world
         self.training_state = TrainingState.TRAINING
         self.num_iterations = 0
         self.collision_times = 0
+        self.robot_trapped = 0
         self.pbar.reset()
 
         return self._get_observation(), {}
@@ -250,14 +256,16 @@ class SimpleEnv(gym.Env):
             return self.training_state
 
         # 2) Robot Trapped?
-        laser_ranges = np.array(self.laser_pool[-1].ranges)
-        collision_points = np.where(laser_ranges <= robot_radius)[0]
-        if len(collision_points) > 50:
-            self.collision_times += 1
-            rospy.logwarn_throttle(1, f"collision ++ = {self.collision_times}")
+        delta_distance = math.sqrt(math.pow(self.last_pose.pose.position.x - curr_pose.pose.position.x, 2) +
+                                   math.pow(self.last_pose.pose.position.y - curr_pose.pose.position.y, 2))
+        delta_angle = abs(angles.normalize_angle(get_yaw(curr_pose.pose.orientation) -
+                                                 get_yaw(self.last_pose.pose.orientation)))
+        if delta_distance <= 0.05 and delta_angle <= 0.05:
+            self.robot_trapped += 1
         else:
-            self.collision_times = 0
-        if self.collision_times > 10:
+            self.robot_trapped = 0
+            self.last_pose = curr_pose
+        if self.robot_trapped >= 5:
             self.training_state = TrainingState.COLLISION
             self._cmd_vel_pub.publish(Twist())
             rospy.logfatal("Collision")
@@ -384,7 +392,7 @@ if __name__ == "__main__":
     load_network_parameters(model.policy)
     save_model_callback = SaveOnBestTrainingRewardCallback(check_freq=512, log_dir=save_log_dir, verbose=2)
     callback_list = CallbackList([save_model_callback])
-    model.learn(total_timesteps=1000000,
+    model.learn(total_timesteps=200000,
                 log_interval=5,
                 tb_log_name='drl_policy',
                 reset_num_timesteps=True,
