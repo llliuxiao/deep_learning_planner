@@ -1,5 +1,6 @@
-from typing import Optional, Callable, Tuple
 import math
+from typing import Optional, Callable, Tuple
+
 import torch
 import torch.nn.functional as F
 from beartype import beartype
@@ -199,9 +200,6 @@ class RobotTransformer(nn.Module):
         #     nn.Linear(1080, 512)
         # )
         self.global_plan_pre = nn.Linear(3, 256)
-        # self.laser_transformer = Transformer(dim=512, dim_head=64,
-        #                                      heads=8, depth=6,
-        #                                      attn_dropout=0.1, ff_dropout=0.1)
         self.position_encoding = PositionalEncoding(d_model=256, max_seq_len=20)
         self.global_plan_transformer = Transformer(dim=256, dim_head=64,
                                                    heads=4, depth=4,

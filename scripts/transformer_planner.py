@@ -22,7 +22,7 @@ from tf2_ros.transform_listener import TransformListener
 from transformer_network import RobotTransformer
 from parameters import *
 
-model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model5/best.pth"
+model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model7/best.pth"
 
 
 class TransformerPlanner:

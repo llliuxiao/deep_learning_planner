@@ -20,10 +20,11 @@ goal_radius = 0.3
 deceleration_tolerance = 1.0
 
 # reinforcement learning train
-max_iteration = 1024
+max_iteration = 512
 
 goal_reached_reward = 1000
 velocity_reward_weight = 1.0
 collision_punish = -1000
-angular_punish_weight = 2.0
+angular_punish_weight = 5.0
 obstacle_punish_weight = 10.0
+imu_punish_weight = 2.0

@@ -1,15 +1,15 @@
-# not finish yet
-
 # utils
 import math
 import os
 import re
 import enum
+import numpy as np
+import tqdm
 
 # gym
 import gymnasium as gym
 import gymnasium.spaces as spaces
-import numpy as np
+
 # ROS
 import rospy
 import torch
@@ -19,21 +19,24 @@ from gymnasium.utils import seeding
 from isaac_sim.msg import ResetPosesAction, ResetPosesGoal
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from nav_msgs.msg import OccupancyGrid, Path
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, Imu
+from std_msgs.msg import Empty
+from std_srvs.srv import Empty
+from deep_learning_planner.msg import RewardFunction
+
+# Stable-baseline3
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.results_plotter import load_results, ts2xy
 from stable_baselines3.ppo import PPO
-from std_msgs.msg import Empty
-from std_srvs.srv import Empty
 
-from transformer_network import RobotTransformer
+# package
+from transformer_drl_network import CustomActorCriticPolicy, TransformerFeatureExtractor
 from pose_utils import PoseUtils, get_yaw
-import tqdm
 from parameters import *
 
 save_log_dir = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs"
-pretrained_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/logs/model/best.pth"
+pretrained_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model7/best.pth"
 if not os.path.exists(save_log_dir):
     os.makedirs(save_log_dir)
 
@@ -70,6 +73,7 @@ class SimpleEnv(gym.Env):
         # private variable
         self.global_plan = Path()
         self.map = OccupancyGrid()
+        self.imu = Imu()
         self.laser_pool = []
         self.training_state = TrainingState.TRAINING
         self.num_iterations = 0
@@ -78,12 +82,15 @@ class SimpleEnv(gym.Env):
         self.pbar = tqdm.tqdm(total=max_iteration)
 
         # ros
-        self._plan_sub = rospy.Subscriber("/move_base/GlobalPlanner/plan", Path, self._path_callback, queue_size=1)
+        self._plan_sub = rospy.Subscriber("/move_base/GlobalPlanner/robot_frame_plan",
+                                          Path, self._path_callback, queue_size=1)
         self._map_sub = rospy.Subscriber("/map", OccupancyGrid, self._map_callback, queue_size=1)
         self._laser_sub = rospy.Subscriber("/scan", LaserScan, self._laser_callback, queue_size=1)
         self._init_pub = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=1)
         self._cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
         self._goal_pub = SimpleActionClient("/move_base", MoveBaseAction)
+        self._reward_pub = rospy.Publisher("/reward", RewardFunction, queue_size=1)
+        self._imu_sub = rospy.Subscriber("/imu", Imu, self._imu_callback, queue_size=1)
 
         # isaac sim
         self._pause_client = rospy.ServiceProxy("/pause", Empty)
@@ -178,7 +185,7 @@ class SimpleEnv(gym.Env):
             global_plan = global_plan[:min(len(global_plan), look_ahead_poses * down_sample):down_sample, :]
             if len(global_plan) < look_ahead_poses:
                 padding = np.stack([pos for _ in range(look_ahead_poses - len(global_plan))], axis=0)
-                global_plan = torch.concat([global_plan, padding])
+                global_plan = np.concatenate([global_plan, padding], axis=0)
         else:
             global_plan = np.stack([pos for _ in range(look_ahead_poses)], axis=0)
         global_plan = global_plan / np.array([look_ahead_distance, look_ahead_distance, np.pi])
@@ -190,23 +197,32 @@ class SimpleEnv(gym.Env):
         }
 
     def _get_reward(self, action):
+        reward_msg = RewardFunction()
         reward = 0
         linear = action[0] * (max_vel_x - min_vel_x) + min_vel_x
         angular = action[1] * (max_vel_z - min_vel_z) + min_vel_z
 
         if self.training_state == TrainingState.REACHED:
             reward += goal_reached_reward
+            reward_msg.goal_reach_reward = goal_reached_reward
 
         if self.training_state == TrainingState.COLLISION:
             reward += collision_punish
+            reward_msg.collision_punish = -collision_punish
         else:
             min_obstacle_distance = min(self.laser_pool[-1].ranges)
             if min_obstacle_distance < 2 * robot_radius:
                 reward -= (2 * robot_radius - min_obstacle_distance) * obstacle_punish_weight
+                reward_msg.collision_punish = -(2 * robot_radius - min_obstacle_distance) * obstacle_punish_weight
 
-        reward += linear * velocity_reward_weight
-        reward -= angular * angular_punish_weight
-
+        reward += linear * abs(velocity_reward_weight)
+        reward -= abs(angular) * angular_punish_weight
+        reward -= abs(self.imu.linear_acceleration.x) * imu_punish_weight
+        reward_msg.linear_vel_reward = linear * abs(velocity_reward_weight)
+        reward_msg.angular_vel_punish = -abs(angular) * angular_punish_weight
+        reward_msg.imu_punish = -abs(self.imu.linear_acceleration.x) * imu_punish_weight
+        reward_msg.total_reward = reward
+        self._reward_pub.publish(reward_msg)
         return reward
 
     def _take_action(self, action):
@@ -263,10 +279,13 @@ class SimpleEnv(gym.Env):
     def _laser_callback(self, laser_msg: LaserScan):
         if len(self.laser_pool) > self.laser_pool_capacity:
             self.laser_pool.pop(0)
-            self.laser_pool.append(laser_msg.ranges)
+        self.laser_pool.append(laser_msg)
 
     def _path_callback(self, global_path_msg):
         self.global_plan = global_path_msg
+
+    def _imu_callback(self, msg: Imu):
+        self.imu = msg
 
     # Service Clients
     def _pause(self):
@@ -286,16 +305,13 @@ def load_network_parameters(net_model):
     action_net_param = {}
     for k, v in param.items():
         if re.search("^module.action_net.", k):
-            new_k = k.replace("module.action_net.", "")
+            new_k = re.sub("^module.action_net.[0-9].", "", k)
             action_net_param[new_k] = v
         elif re.search("^module.value_net.", k):
-            new_k = k.replace("module.value_net.", "")
+            new_k = re.sub("^module.value_net.[0-9].", "", k)
             value_net_param[new_k] = v
-        elif re.search("^module.mlp_extractor_actor.", k):
-            new_k = k.replace("module.mlp_extractor_actor.", "policy_net.")
-            mlp_extractor_param[new_k] = v
-        elif re.search("^module.mlp_extractor_critic.", k):
-            new_k = k.replace("module.mlp_extractor_critic.", "value_net.")
+        elif re.search("^module.mlp_extractor_(actor|critic).", k):
+            new_k = k.replace("module.", "")
             mlp_extractor_param[new_k] = v
         elif re.search("^module.", k):
             new_k = k.replace("module.", "")
@@ -348,15 +364,17 @@ if __name__ == "__main__":
     rospy.init_node('simple_rl_training', log_level=rospy.INFO)
     env = Monitor(SimpleEnv(), save_log_dir)
     policy_kwargs = dict(
-        features_extractor_class=RobotTransformer,
+        features_extractor_class=TransformerFeatureExtractor,
         features_extractor_kwargs=dict(features_dim=512),
-        net_arch=dict(pi=[256], vf=[128])
+        activation_fn=torch.nn.ReLU,
+        net_arch=dict(pi=[256], vf=[128]),
+        log_std_init=-1.5
     )
-    model = PPO("MultiInputPolicy",  # ?
+    model = PPO(CustomActorCriticPolicy,  # ?
                 env=env,
                 verbose=2,  # similar to log level
                 learning_rate=5e-6,
-                batch_size=512,
+                batch_size=256,
                 tensorboard_log=save_log_dir,
                 n_epochs=10,  # run n_epochs after collecting a roll-out buffer to optimize parameters
                 n_steps=max_iteration,  # the size of roll-out buffer
@@ -364,8 +382,8 @@ if __name__ == "__main__":
                 policy_kwargs=policy_kwargs,
                 device=torch.device("cuda"))
     load_network_parameters(model.policy)
-    save_model_callback = SaveOnBestTrainingRewardCallback(check_freq=5000, log_dir=save_log_dir, verbose=2)
-    callback_list = CallbackList([])
+    save_model_callback = SaveOnBestTrainingRewardCallback(check_freq=512, log_dir=save_log_dir, verbose=2)
+    callback_list = CallbackList([save_model_callback])
     model.learn(total_timesteps=1000000,
                 log_interval=5,
                 tb_log_name='drl_policy',

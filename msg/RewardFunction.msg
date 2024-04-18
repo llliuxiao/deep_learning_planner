@@ -1,0 +1,6 @@
+float64 goal_reach_reward
+float64 linear_vel_reward
+float64 angular_vel_punish
+float64 collision_punish
+float64 imu_punish
+float64 total_reward
