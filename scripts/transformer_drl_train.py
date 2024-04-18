@@ -42,6 +42,8 @@ pretrained_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/tra
 if not os.path.exists(save_log_dir):
     os.makedirs(save_log_dir)
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 
 class TrainingState(enum.Enum):
     REACHED = 0,
@@ -325,7 +327,7 @@ def load_network_parameters(net_model):
             new_k = k.replace("module.", "")
             feature_extractor_param[new_k] = v
     # do not update parameter in feature extractor
-    net_model.features_extractor.requires_grad_(False)
+    # net_model.features_extractor.requires_grad_(True)
     net_model.action_net.load_state_dict(action_net_param)
     net_model.value_net.load_state_dict(value_net_param)
     net_model.features_extractor.load_state_dict(feature_extractor_param)
@@ -385,12 +387,12 @@ if __name__ == "__main__":
                 batch_size=256,
                 tensorboard_log=save_log_dir,
                 n_epochs=10,  # run n_epochs after collecting a roll-out buffer to optimize parameters
-                n_steps=max_iteration,  # the size of roll-out buffer
+                n_steps=256,  # the size of roll-out buffer
                 gamma=0.99,  # discount factors
                 policy_kwargs=policy_kwargs,
-                device=torch.device("cuda"))
+                device="cuda")
     load_network_parameters(model.policy)
-    save_model_callback = SaveOnBestTrainingRewardCallback(check_freq=512, log_dir=save_log_dir, verbose=2)
+    save_model_callback = SaveOnBestTrainingRewardCallback(check_freq=256, log_dir=save_log_dir, verbose=2)
     callback_list = CallbackList([save_model_callback])
     model.learn(total_timesteps=200000,
                 log_interval=5,

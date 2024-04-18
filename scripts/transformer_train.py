@@ -27,6 +27,8 @@ while True:
     eval_save_dir = f"{save_root}/runs/eval{index}"
     break
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
 
 class VelocityCmdLoss(nn.Module):
     def __init__(self, device=torch.device("cuda")):
