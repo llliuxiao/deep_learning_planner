@@ -24,7 +24,11 @@ max_iteration = 512
 
 goal_reached_reward = 1000
 velocity_reward_weight = 1.0
+pave_punish = 1.0
+move_forward_reward_weight = 1.0
 collision_punish = -1000
-angular_punish_weight = 5.0
-obstacle_punish_weight = 10.0
-imu_punish_weight = 2.0
+angular_punish_weight = 1.0
+obstacle_punish_weight = 5.0
+imu_punish_weight = 0.5
+follow_reward = 1.0
+unfollow_punish_weight = 2.0

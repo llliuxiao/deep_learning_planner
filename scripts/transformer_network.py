@@ -192,20 +192,24 @@ class Transformer(nn.Module):
 
 @beartype
 class RobotTransformer(nn.Module):
-    def __init__(self, frame=6):
+    def __init__(self):
         super().__init__()
-        self.frame = frame
-        # self.laser_pre = nn.Sequential(
-        #     # nn.AvgPool1d(kernel_size=3, stride=3),
-        #     nn.Linear(1080, 512)
-        # )
+        # laser
+        self.laser_pre = nn.Linear(1080, 512)
+        self.laser_position_encoding = PositionalEncoding(d_model=512, max_seq_len=6)
+        self.laser_transformer = Transformer(dim=512, dim_head=64,
+                                             heads=8, depth=6,
+                                             attn_dropout=0.1, ff_dropout=0.1)
+
+        # global plan
         self.global_plan_pre = nn.Linear(3, 256)
-        self.position_encoding = PositionalEncoding(d_model=256, max_seq_len=20)
+        self.global_plan_position_encoding = PositionalEncoding(d_model=256, max_seq_len=20)
         self.global_plan_transformer = Transformer(dim=256, dim_head=64,
                                                    heads=4, depth=4,
                                                    attn_dropout=0.1, ff_dropout=0.1)
         self.dense = nn.Sequential(
-            nn.Linear(256 + 3, 512), nn.ReLU(),
+            nn.Linear(512 + 256 + 3, 1024), nn.ReLU(),
+            nn.Linear(1024, 512), nn.ReLU()
         )
         self.mlp_extractor_actor = nn.Sequential(nn.Linear(512, 256), nn.ReLU())
         self.mlp_extractor_critic = nn.Sequential(nn.Linear(512, 128), nn.ReLU())
@@ -213,17 +217,18 @@ class RobotTransformer(nn.Module):
         self.value_net = nn.Sequential(nn.Linear(128, 1))
 
     def forward(self, laser, global_plan, goal, laser_mask):
-        # pooled_laser = self.laser_pre(laser)
-        high_dim_global_plan = self.global_plan_pre(global_plan)
-
+        pooled_laser = self.laser_pre(laser)
+        positional_laser = self.laser_position_encoding(pooled_laser)
         laser_mask = torch.squeeze(laser_mask)
-        # attended_laser = self.laser_transformer(pooled_laser, attn_mask=laser_mask)
-        position_encoding = self.position_encoding(high_dim_global_plan)
-        attended_global_plan = self.global_plan_transformer(position_encoding)
+        attended_laser = self.laser_transformer(positional_laser, attn_mask=laser_mask)
 
-        # laser_token = reduce(attended_laser, 'b f d -> b d', 'mean')
+        high_dim_global_plan = self.global_plan_pre(global_plan)
+        positional_path = self.global_plan_position_encoding(high_dim_global_plan)
+        attended_global_plan = self.global_plan_transformer(positional_path)
+
+        laser_token = reduce(attended_laser, 'b f d -> b d', 'mean')
         global_plan_token = reduce(attended_global_plan, 'b f d -> b d', 'mean')
 
-        tensor = torch.concat((global_plan_token, goal), dim=1)
+        tensor = torch.concat((laser_token, global_plan_token, goal), dim=1)
         feature = self.dense(tensor)
         return self.action_net(self.mlp_extractor_actor(feature))

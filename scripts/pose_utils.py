@@ -11,6 +11,7 @@ import tf2_geometry_msgs
 # utils
 import random
 import math
+import json
 
 
 def get_yaw(quaternion: Quaternion):
@@ -19,10 +20,13 @@ def get_yaw(quaternion: Quaternion):
 
 
 class PoseUtils:
-    def __init__(self, robot_radius):
+    def __init__(self, robot_radius, scene=None):
         self.buffer = Buffer()
         self.listener = TransformListener(self.buffer)
         self.robot_radius = robot_radius
+        if scene is not None:
+            with open(f"/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/points/{scene}.json", "r") as f:
+                self.points = json.load(f)["points"]
 
     def get_robot_pose(self, source_frame: str, target_frame: str):
         try:
@@ -78,6 +82,26 @@ class PoseUtils:
             return pose
         else:
             return self.transform_pose(pose, target_frame)
+
+    def get_preset_pose(self, frame):
+        index = random.randint(0, len(self.points) - 1)
+        (x0, y0, yaw0, x1, y1, yaw1) = self.points[index]
+        robot_pose = self._make_pose(x0, y0, yaw0, frame)
+        target_pose = self._make_pose(x1, y1, yaw1, frame)
+        return robot_pose, target_pose
+
+    @staticmethod
+    def _make_pose(x, y, yaw, frame):
+        pose = PoseStamped()
+        pose.header.frame_id = frame
+        pose.pose.position.x = x
+        pose.pose.position.y = y
+        (x_, y_, z_, w_) = quaternion_from_euler(0, 0, yaw)
+        pose.pose.orientation.x = x_
+        pose.pose.orientation.y = y_
+        pose.pose.orientation.z = z_
+        pose.pose.orientation.w = w_
+        return pose
 
     def _is_pose_valid(self, x, y, static_map):
         cell_radius = int(self.robot_radius / static_map.info.resolution)

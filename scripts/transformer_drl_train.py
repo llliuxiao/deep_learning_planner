@@ -38,11 +38,12 @@ from pose_utils import PoseUtils, get_yaw
 from parameters import *
 
 save_log_dir = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs"
-pretrained_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model7/best.pth"
+pretrained_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model8/best.pth"
 if not os.path.exists(save_log_dir):
     os.makedirs(save_log_dir)
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+scene = "hospital"
 
 
 class TrainingState(enum.Enum):
@@ -72,7 +73,7 @@ class SimpleEnv(gym.Env):
         })
 
         # utils
-        self._pose_utils = PoseUtils(robot_radius)
+        self._pose_utils = PoseUtils(robot_radius, scene=scene)
 
         # private variable
         self.global_plan = Path()
@@ -86,6 +87,8 @@ class SimpleEnv(gym.Env):
         self.pbar = tqdm.tqdm(total=max_iteration)
         self.last_pose = None
         self.robot_trapped = 0
+        self.last_global_plan_length = None
+        self.explore_punish_pool = []
 
         # ros
         self._plan_sub = rospy.Subscriber("/move_base/GlobalPlanner/robot_frame_plan",
@@ -108,12 +111,15 @@ class SimpleEnv(gym.Env):
 
     # Observation, Reward, terminated, truncated, info
     def step(self, action):
+        start_time = rospy.Time.now()
         self._unpause()
         self._take_action(action)
         observations = self._get_observation()
         self._pause()
         state = self._is_done()
-        reward = self._get_reward(action)
+        reward = self._get_reward(action, observations)
+        end_time = rospy.Time.now()
+        rospy.logfatal(f"step time: {(end_time - start_time).to_sec()}(s)")
         return (observations, reward, state == TrainingState.REACHED,
                 state == TrainingState.COLLISION or state == TrainingState.TRUNCATED, {})
 
@@ -122,7 +128,10 @@ class SimpleEnv(gym.Env):
         isaac_init_poses = ResetPosesGoal()
         self._cmd_vel_pub.publish(Twist())
 
-        init_pose = self._pose_utils.get_random_pose(self.map, self.map_frame, self.map_frame)
+        # init_pose = self._pose_utils.get_random_pose(self.map, self.map_frame, self.map_frame)
+        # self.target = self._pose_utils.get_random_pose(self.map, self.map_frame, self.map_frame)
+        init_pose, self.target = self._pose_utils.get_preset_pose(self.map_frame)
+
         init_pose_world = self._pose_utils.transform_pose(init_pose, self.map_frame)
         isaac_init_poses.poses.append(init_pose_world)
         isaac_init_poses.prefix.append(0)
@@ -142,7 +151,6 @@ class SimpleEnv(gym.Env):
         rospy.sleep(2.0)
 
         # publish new goal
-        self.target = self._pose_utils.get_random_pose(self.map, self.map_frame, self.map_frame)
         move_base_goal = MoveBaseGoal()
         move_base_goal.target_pose = self.target
         self._goal_pub.send_goal(move_base_goal)
@@ -154,6 +162,8 @@ class SimpleEnv(gym.Env):
         self.num_iterations = 0
         self.collision_times = 0
         self.robot_trapped = 0
+        self.last_global_plan_length = None
+        self.explore_punish_pool.clear()
         self.pbar.reset()
 
         return self._get_observation(), {}
@@ -177,9 +187,12 @@ class SimpleEnv(gym.Env):
                 break
 
     def _get_observation(self):
+        # goal
         pose = self._pose_utils.transform_pose(self.target, self.robot_frame)
         assert isinstance(pose, PoseStamped)
         pos = np.array((pose.pose.position.x, pose.pose.position.y, get_yaw(pose.pose.orientation)))
+
+        # global plan
         assert isinstance(self.global_plan, Path)
         global_plan = []
         for pose in self.global_plan.poses:
@@ -196,39 +209,79 @@ class SimpleEnv(gym.Env):
                 global_plan = np.concatenate([global_plan, padding], axis=0)
         else:
             global_plan = np.stack([pos for _ in range(look_ahead_poses)], axis=0)
+
         global_plan = global_plan / np.array([look_ahead_distance, look_ahead_distance, np.pi])
         pos = pos / np.array([look_ahead_distance, look_ahead_distance, np.pi])
+
+        # lasers
+        lasers = [self.laser_pool[-1] for _ in range(laser_length)]
+        for i in range(laser_length - 1, 0, -1):
+            prefix = len(self.laser_pool) - i * interval
+            if prefix < 0:
+                continue
+            else:
+                lasers[laser_length - i - 1] = self.laser_pool[prefix]
+        lasers = np.array(lasers) / laser_range
         return {
-            "laser": np.random.rand(6, 1080),
+            "laser": lasers,
             "global_plan": global_plan,
             "goal": pos
         }
 
-    def _get_reward(self, action):
+    def _get_reward(self, action, observation):
         reward_msg = RewardFunction()
+        global_plan = observation["global_plan"]
+        global_plan_length = len(self.global_plan.poses)
         reward = 0
         linear = action[0] * (max_vel_x - min_vel_x) + min_vel_x
         angular = action[1] * (max_vel_z - min_vel_z) + min_vel_z
 
+        # goal reach reward
         if self.training_state == TrainingState.REACHED:
             reward += goal_reached_reward
             reward_msg.goal_reach_reward = goal_reached_reward
 
+        # collision or close to obstacle punish
         if self.training_state == TrainingState.COLLISION:
             reward += collision_punish
             reward_msg.collision_punish = -collision_punish
         else:
-            min_obstacle_distance = min(self.laser_pool[-1].ranges)
+            min_obstacle_distance = min(self.laser_pool[-1])
             if min_obstacle_distance < 2 * robot_radius:
                 reward -= (2 * robot_radius - min_obstacle_distance) * obstacle_punish_weight
                 reward_msg.collision_punish = -(2 * robot_radius - min_obstacle_distance) * obstacle_punish_weight
 
-        reward += linear * abs(velocity_reward_weight)
+        # move forward reward
+        if self.last_global_plan_length is None:
+            reward_msg.move_forward_reward = 0.0
+        else:
+            delta_length = self.last_global_plan_length - global_plan_length
+            if delta_length <= 0:
+                reward -= 1
+                reward_msg.move_forward_reward = -1
+            else:
+                reward += delta_length * move_forward_reward_weight
+                reward_msg.move_forward_reward = delta_length * move_forward_reward_weight
+
+        # angular velocity punish
         reward -= abs(angular) * angular_punish_weight
-        reward -= abs(self.imu.linear_acceleration.x) * imu_punish_weight
-        reward_msg.linear_vel_reward = linear * abs(velocity_reward_weight)
         reward_msg.angular_vel_punish = -abs(angular) * angular_punish_weight
+
+        # imu linear acceleration punish
+        reward -= abs(self.imu.linear_acceleration.x) * imu_punish_weight
         reward_msg.imu_punish = -abs(self.imu.linear_acceleration.x) * imu_punish_weight
+
+        # follow global path reward
+        distance = np.sqrt(np.linalg.norm(global_plan[:, :2], axis=1))
+        min_distance = np.min(distance) * look_ahead_distance
+        if min_distance < 0.1:
+            reward += follow_reward
+            reward_msg.follow_reward = follow_reward
+        else:
+            reward -= min_distance * unfollow_punish_weight
+            reward_msg.follow_reward = -min_distance * unfollow_punish_weight
+
+        self.last_global_plan_length = global_plan_length
         reward_msg.total_reward = reward
         self._reward_pub.publish(reward_msg)
         return reward
@@ -289,7 +342,7 @@ class SimpleEnv(gym.Env):
     def _laser_callback(self, laser_msg: LaserScan):
         if len(self.laser_pool) > self.laser_pool_capacity:
             self.laser_pool.pop(0)
-        self.laser_pool.append(laser_msg)
+        self.laser_pool.append(laser_msg.ranges)
 
     def _path_callback(self, global_path_msg):
         self.global_plan = global_path_msg
@@ -378,7 +431,7 @@ if __name__ == "__main__":
         features_extractor_kwargs=dict(features_dim=512),
         activation_fn=torch.nn.ReLU,
         net_arch=dict(pi=[256], vf=[128]),
-        log_std_init=-1.5
+        log_std_init=-1.0
     )
     model = PPO(CustomActorCriticPolicy,  # ?
                 env=env,
