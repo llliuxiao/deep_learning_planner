@@ -211,10 +211,8 @@ class RobotTransformer(nn.Module):
             nn.Linear(512 + 256 + 3, 1024), nn.ReLU(),
             nn.Linear(1024, 512), nn.ReLU()
         )
-        self.mlp_extractor_actor = nn.Sequential(nn.Linear(512, 256), nn.ReLU())
-        self.mlp_extractor_critic = nn.Sequential(nn.Linear(512, 128), nn.ReLU())
-        self.action_net = nn.Sequential(nn.Linear(256, 2), nn.Softplus())
-        self.value_net = nn.Sequential(nn.Linear(128, 1))
+        self.mlp_extractor_policy = nn.Sequential(nn.Linear(512, 256), nn.ReLU())
+        self.policy_net = nn.Sequential(nn.Linear(256, 2))
 
     def forward(self, laser, global_plan, goal, laser_mask):
         pooled_laser = self.laser_pre(laser)
@@ -231,4 +229,4 @@ class RobotTransformer(nn.Module):
 
         tensor = torch.concat((laser_token, global_plan_token, goal), dim=1)
         feature = self.dense(tensor)
-        return self.action_net(self.mlp_extractor_actor(feature))
+        return self.policy_net(self.mlp_extractor_policy(feature))

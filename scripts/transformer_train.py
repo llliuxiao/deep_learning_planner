@@ -33,13 +33,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 class VelocityCmdLoss(nn.Module):
     def __init__(self, device=torch.device("cuda")):
         super().__init__()
-        self.coefficient = torch.tensor([max_vel_x - min_vel_x, max_vel_z - min_vel_z], dtype=torch.float).to(device)
-        self.intercept = torch.tensor([min_vel_x, min_vel_z], dtype=torch.float).to(device)
 
     def forward(self, inputs, targets):
-        coefficient = torch.mul(inputs, self.coefficient)
-        intercept = torch.add(coefficient, self.intercept)
-        sub = torch.sub(targets, intercept)
+        sub = torch.sub(targets, inputs)
         pow = torch.pow(sub, 2)
         sum = torch.sum(pow, dim=1)
         sqrt = torch.sqrt(sum)
@@ -68,9 +64,6 @@ class Trainner:
         self.training_total_step = 0
         self.eval_total_step = 0
 
-        self.coefficient = torch.tensor([max_vel_x - min_vel_x, max_vel_z - min_vel_z], dtype=torch.float).to(device)
-        self.intercept = torch.tensor([min_vel_x, min_vel_z], dtype=torch.float).to(device)
-
         self.best_loss = math.inf
         torch.manual_seed(1)
         print(self.model)
@@ -84,10 +77,7 @@ class Trainner:
         self.lr_decay.last_epoch = start_epoch
 
     def get_single_loss(self, predicts, targets):
-        coefficient = torch.mul(predicts, self.coefficient)
-        intercept = torch.add(coefficient, self.intercept)
-
-        sub = torch.sub(targets, intercept)
+        sub = torch.sub(targets, predicts)
         fabs = torch.abs(sub)
         sum = torch.sum(fabs, dim=0)
         squeeze = torch.squeeze(sum)
@@ -184,8 +174,6 @@ if __name__ == "__main__":
     for i in range(epoch):
         planner.train(i)
         eval_loss = planner.eval(i)
-        if eval_loss <= 0.05:
-            break
         # planner.save_checkpoint(i)
         if i > 0 and i % 5 == 0:
             planner.lr_decay.step()
