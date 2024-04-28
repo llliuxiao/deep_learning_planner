@@ -4,7 +4,7 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from tf2_ros import TransformException
 from geometry_msgs.msg import PoseStamped, Quaternion
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 import tf2_geometry_msgs
 
@@ -12,11 +12,25 @@ import tf2_geometry_msgs
 import random
 import math
 import json
+import sys
+
+sys.path.append("/usr/lib/python3/dist-packages")
 
 
 def get_yaw(quaternion: Quaternion):
     _, _, yaw = euler_from_quaternion([quaternion.x, quaternion.y, quaternion.z, quaternion.w])
     return yaw
+
+
+def get_distance_from_path(path: Path):
+    distance = 0.0
+    for i in range(len(path.poses) - 1):
+        pose1 = path.poses[i]
+        pose2 = path.poses[i + 1]
+        dx = pose2.pose.position.x - pose1.pose.position.x
+        dy = pose2.pose.position.y - pose1.pose.position.y
+        distance += math.sqrt(dx * dx + dy * dy)
+    return distance
 
 
 class PoseUtils:

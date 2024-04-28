@@ -1,5 +1,6 @@
 float64 goal_reach_reward
 float64 move_forward_reward
+float64 linear_velocity_reward
 float64 angular_vel_punish
 float64 collision_punish
 float64 imu_punish

@@ -1,4 +1,3 @@
-from data import load_data
 from transformer_network import RobotTransformer
 from thop import profile
 import torch
