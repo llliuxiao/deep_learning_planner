@@ -1,15 +1,39 @@
+import os
+
+from omni.isaac.kit import SimulationApp
+
+linux_user = os.getlogin()
+CARTER_USD_PATH = f"/home/{linux_user}/isaac_sim_ws/src/isaac_sim/isaac/carter.usd"
+config = {
+    "headless": True
+}
+simulation_app = SimulationApp(config)
+
+# utils
+
+# isaac
+from omni.isaac.core import World
+from omni.isaac.wheeled_robots.robots import WheeledRobot
+from omni.isaac.wheeled_robots.controllers.differential_controller import DifferentialController
+from omni.isaac.core.prims import GeometryPrim
+from omni.isaac.core.utils.stage import add_reference_to_stage
+from omni.isaac.sensor import RotatingLidarPhysX
+from omni.isaac.range_sensor import _range_sensor
+from omni.isaac.core.utils.nucleus import get_assets_root_path
+
 # utils
 import enum
 import math
 import os
 import re
-import sys
 import time
-import typing
-
 import angles
+import sys
+import torch
+import tqdm
 
 sys.path.append(f"/home/{os.getlogin()}/isaac_sim_ws/devel/lib/python3/dist-packages")
+
 # gym
 import gymnasium as gym
 import gymnasium.spaces as spaces
@@ -17,25 +41,18 @@ import numpy as np
 
 # ROS
 import rospy
-import torch
-import tqdm
 from actionlib import SimpleActionClient
-from deep_learning_planner.msg import RewardFunction
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped
 from gymnasium.utils import seeding
-from isaac_sim.msg import ResetPosesAction, ResetPosesGoal, ResetPosesResult, StepAction, StepGoal, StepResult
-from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from nav_msgs.msg import OccupancyGrid, Path
-from sensor_msgs.msg import LaserScan, Imu
-from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Imu
+from isaac_sim.msg import PlanAction, PlanGoal, PlanResult
 
 # Stable-baseline3
 from stable_baselines3.common.callbacks import CallbackList
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.sac import SAC
 from stable_baselines3.sac.policies import SACPolicy
-from std_msgs.msg import Empty
-from std_srvs.srv import Empty
 
 from parameters import *
 from pose_utils import PoseUtils, get_yaw, get_distance_from_path
@@ -47,7 +64,6 @@ pretrained_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/tra
 if not os.path.exists(save_log_dir):
     os.makedirs(save_log_dir)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 scene = "hospital"
 
 
@@ -62,6 +78,9 @@ class SimpleEnv(gym.Env):
     def __init__(self):
         # Random seeds
         self.seed()
+
+        # isaac
+        self._setup_scene()
 
         # const
         self.robot_frame = "base_link"
@@ -98,97 +117,51 @@ class SimpleEnv(gym.Env):
         self.last_geodesic_distance = 0
 
         # ros
-        global_plan_topic = "/move_base/GlobalPlanner/robot_frame_plan"
-        self._plan_sub = rospy.Subscriber(global_plan_topic, Path, self._path_callback, queue_size=1)
         self._map_sub = rospy.Subscriber("/map", OccupancyGrid, self._map_callback, queue_size=1)
-        self._laser_sub = rospy.Subscriber("/scan", LaserScan, self._laser_callback, queue_size=10)
-        self._init_pub = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=1)
-        self._goal_pub = SimpleActionClient("/move_base", MoveBaseAction)
-        self._reward_pub = rospy.Publisher("/reward", RewardFunction, queue_size=1)
-        self._imu_sub = rospy.Subscriber("/imu", Imu, self._imu_callback, queue_size=10)
-
-        # isaac sim
-        self._close_client = rospy.ServiceProxy("/close", Empty)
-        self._reset_client = SimpleActionClient("/reset", ResetPosesAction)
-        self._step_client = SimpleActionClient("/step", StepAction)
-        self._wait_for_map()
+        self._plan_client = SimpleActionClient("/plan", PlanAction)
+        self._pose_pub = rospy.Publisher("/robot_pose", PoseStamped, queue_size=1)
 
     # Observation, Reward, terminated, truncated, info
     def step(self, action):
         self.pbar.update()
-        start_time = time.time()
-        cmd_vel = Twist()
         forward = np.clip(action[0], min_vel_x, max_vel_x)
         angular = np.clip(action[1], min_vel_z, max_vel_z)
-        cmd_vel.linear.x = forward
-        cmd_vel.angular.z = angular
-
-        self._cmd_vel_pub.publish(cmd_vel)
-        time.sleep(0.05)
-        rospy.loginfo("delay")
-
-        observations = self._get_observation()
+        self.robot.apply_wheel_actions(self.controller.forward(command=np.array([forward, angular])))
+        self.world.step(render=False)
+        plan = self._make_plan()
+        observations = self._get_observation(plan)
         state = self._is_done()
         reward, info = self._get_drl_vo_reward(action, observations)
-
-        end_time = time.time()
-        rospy.logfatal(f"step time: {end_time - start_time}")
-
         return (observations, reward, state == TrainingState.REACHED,
                 state == TrainingState.COLLISION or state == TrainingState.TRUNCATED, info)
 
     def reset(self, **kwargs):
         rospy.loginfo("resetting!")
+        self._wait_for_map()
 
         # clear the buffer before resetting
+        self.robot.apply_wheel_actions(self.controller.forward(command=np.array([0.0, 0.0])))
+        self.world.step(render=False)
+        self.world.reset()
         self.laser_pool.clear()
-        self._cmd_vel_pub.publish(Twist())
 
-        isaac_init_poses = ResetPosesGoal()
         init_pose, self.target = self._pose_utils.get_preset_pose(self.map_frame)
 
-        init_pose_world = self._pose_utils.transform_pose(init_pose, self.map_frame)
-        isaac_init_poses.poses.append(init_pose_world)
-        isaac_init_poses.prefix.append(0)
-
         # reset robot pose in isaac sim
-        self._reset_client.wait_for_server()
-        self._reset_client.send_goal_and_wait(isaac_init_poses)
-        time.sleep(3.0)
+        x, y, yaw = (init_pose.pose.position.x, init_pose.pose.position.y, get_yaw(init_pose.pose.orientation))
+        position = np.array([x, y, 0.3])
+        orientation = np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
+        self.robot.set_world_pose(position=position, orientation=orientation)
+        self.world.step(render=False)
+        time.sleep(2.0)
 
-        while True:
-            # reset robot pose in ros amcl
-            amcl_init_pose = PoseWithCovarianceStamped()
-            amcl_init_pose.header = init_pose.header
-            amcl_init_pose.header.stamp = rospy.Time.now()
-            amcl_init_pose.pose.pose = init_pose.pose
-            self._init_pub.publish(amcl_init_pose)
-            time.sleep(3.0)
-
-            # publish new goal
-            move_base_goal = MoveBaseGoal()
-            move_base_goal.target_pose = self.target
-            self._goal_pub.send_goal(move_base_goal)
-
-            self.global_plan = None
-            total_time = 0
-            flag = True
-
-            while self.global_plan is None:
-                time.sleep(0.5)
-                total_time += 0.5
-                if total_time > 10.0:
-                    rospy.logerr("get global plan over 10s, resetting again")
-                    flag = False
-                    break
-            if flag:
-                break
+        plan = self._make_plan()
 
         # reset variables
         # noinspection PyTypeChecker
         self.entire_distance = get_distance_from_path(self.global_plan)
         self.last_geodesic_distance = self.entire_distance
-        self.last_pose = init_pose_world
+        self.last_pose = init_pose
         self.training_state = TrainingState.TRAINING
         self.num_iterations = 0
         self.collision_times = 0
@@ -197,17 +170,31 @@ class SimpleEnv(gym.Env):
         self.explore_punish_pool.clear()
         self.pbar.reset()
 
-        return self._get_observation(), {}
+        return self._get_observation(plan), {}
 
     def close(self):
         rospy.logfatal("Closing IsaacSim Simulator")
-        self._close_client.call()
+        simulation_app.close()
         self.pbar.close()
         rospy.signal_shutdown("Closing ROS Signal")
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
+
+    def _make_plan(self):
+        goal = PlanGoal()
+        goal.target = self.target
+        start_pose = self._make_pose()
+        start_pose.header.frame_id = "map"
+        start_pose.header.stamp = rospy.Time.now()
+        goal.target.header.frame_id = "map"
+        goal.target.header.stamp = rospy.Time.now()
+        goal.start = start_pose
+        self._pose_pub.publish(start_pose)
+        self._plan_client.send_goal_and_wait(goal)
+        result = self._plan_client.get_result()
+        return result
 
     def _wait_for_map(self):
         while True:
@@ -217,22 +204,19 @@ class SimpleEnv(gym.Env):
             else:
                 break
 
-    def _get_observation(self):
+    def _get_observation(self, plan: PlanResult):
         # goal
-        pose = self._pose_utils.transform_pose(self.target, self.robot_frame)
-        assert isinstance(pose, PoseStamped)
-        goal = np.array((pose.pose.position.x, pose.pose.position.y, get_yaw(pose.pose.orientation)))
+        robot_pose = self.robot.get_world_pose()
+        goal = np.array((
+            self.target.pose.position.x - robot_pose[0][0],
+            self.target.pose.position.y - robot_pose[0][1],
+            angles.normalize_angle(
+                get_yaw(self.target.pose.orientation) - angles.normalize_angle(math.acos(robot_pose[1][0]) * 2)
+            )))
 
         # global plan
         assert isinstance(self.global_plan, Path)
-        global_plan = []
-        for pose in self.global_plan.poses:
-            assert isinstance(pose, PoseStamped)
-            x = pose.pose.position.x
-            y = pose.pose.position.y
-            yaw = get_yaw(pose.pose.orientation)
-            global_plan.append((x, y, yaw))
-        global_plan = np.array(global_plan)
+        global_plan = np.array([plan.x, plan.y, plan.yaw]).reshape((-1, 3))
         if len(global_plan) > 0:
             global_plan = global_plan[:min(len(global_plan), look_ahead_poses * down_sample):down_sample, :]
             if len(global_plan) < look_ahead_poses:
@@ -242,6 +226,7 @@ class SimpleEnv(gym.Env):
             global_plan = np.stack([goal for _ in range(look_ahead_poses)], axis=0)
 
         # lasers
+        self._store_laser()
         lasers = [self.laser_pool[-1] for _ in range(laser_length)]
         for i in range(laser_length - 1, 0, -1):
             prefix = len(self.laser_pool) - i * 10
@@ -261,66 +246,6 @@ class SimpleEnv(gym.Env):
             "goal": goal
         }
 
-    def _get_reward(self, action, observation):
-        reward_msg = RewardFunction()
-        global_plan = observation["global_plan"]
-        global_plan_length = len(self.global_plan.poses)
-        reward = 0
-        linear, angular = action
-
-        # goal reach reward
-        if self.training_state == TrainingState.REACHED:
-            reward += goal_reached_reward
-            reward_msg.goal_reach_reward = goal_reached_reward
-        elif self.training_state == TrainingState.TRUNCATED:
-            not_reach_punish = -get_distance_from_path(self.global_plan) / self.entire_distance * goal_reached_reward
-            reward += not_reach_punish
-            reward_msg.goal_reach_reward = not_reach_punish
-
-        # collision or close to obstacle punish
-        if self.training_state == TrainingState.COLLISION:
-            reward -= collision_punish
-            reward_msg.collision_punish = -collision_punish
-        else:
-            min_obstacle_distance = min(self.laser_pool[-1])
-            if min_obstacle_distance < 2 * robot_radius:
-                reward -= (2 * robot_radius - min_obstacle_distance) * obstacle_punish_weight
-                reward_msg.collision_punish = -(2 * robot_radius - min_obstacle_distance) * obstacle_punish_weight
-
-        # move forward reward
-        if self.last_global_plan_length is None:
-            reward_msg.move_forward_reward = 0.0
-        else:
-            delta_length = self.last_global_plan_length - global_plan_length
-            reward_msg.move_forward_reward = -pave_punish if delta_length <= 0 else move_forward_reward
-            reward += reward_msg.move_forward_reward
-
-        # linear velocity reward
-        reward += abs(linear) * velocity_reward_weight
-        reward_msg.linear_velocity_reward = abs(linear) * velocity_reward_weight
-
-        # angular velocity reward
-        (x, y, yaw) = global_plan[look_ahead]
-        angle = math.atan2(y, x)
-        if math.fabs(angle) <= math.pi / 6:
-            reward -= angular * angular_punish_weight
-            reward_msg.angular_vel_punish = angular * angular_punish_weight
-
-        # follow global path reward
-        distance = np.linalg.norm(global_plan[:, :2], axis=1)
-        min_distance = np.min(distance) * look_ahead_distance
-        if min_distance < 0.1:
-            reward += follow_reward
-            reward_msg.follow_reward = follow_reward
-        else:
-            reward -= min_distance * unfollow_punish_weight
-            reward_msg.follow_reward = -min_distance * unfollow_punish_weight
-
-        self.last_global_plan_length = global_plan_length
-        reward_msg.total_reward = reward
-        self._reward_pub.publish(reward_msg)
-        return reward
-
     def _get_drl_vo_reward(self, action, observation):
         info = {}
         r_arrival = 20
@@ -332,8 +257,7 @@ class SimpleEnv(gym.Env):
         w_thresh = 0.7
 
         reward = 0
-        # linear = action[0] * (max_vel_x - min_vel_x) + min_vel_x
-        # angular = action[1] * (max_vel_z - min_vel_z) + min_vel_z
+
         linear, angular = action
         laser = observation["laser"]
 
@@ -371,7 +295,7 @@ class SimpleEnv(gym.Env):
 
     def _is_done(self):
         # 1) Goal reached?
-        curr_pose = self._pose_utils.get_robot_pose(self.robot_frame, self.map_frame)
+        curr_pose = self._make_pose()
         dist_to_goal = np.linalg.norm(
             np.array([
                 curr_pose.pose.position.x - self.target.pose.position.x,
@@ -411,16 +335,70 @@ class SimpleEnv(gym.Env):
     def _map_callback(self, map_msg: OccupancyGrid):
         self.map = map_msg
 
-    def _laser_callback(self, laser_msg: LaserScan):
-        if len(self.laser_pool) > self.laser_pool_capacity:
+    def _make_pose(self):
+        pose = PoseStamped()
+        robot_pose = self.robot.get_world_pose()
+        pose.pose.position.x = robot_pose[0][0]
+        pose.pose.position.y = robot_pose[0][1]
+        pose.pose.orientation.w = robot_pose[1][0]
+        pose.pose.orientation.x = robot_pose[1][1]
+        pose.pose.orientation.y = robot_pose[1][2]
+        pose.pose.orientation.z = robot_pose[1][3]
+        return pose
+
+    def _store_laser(self):
+        cur_laser = self.lidarInterface.get_linear_depth_data(self.lidar_path)[:, 1]
+        if len(self.laser_pool) >= self.laser_pool_capacity:
             self.laser_pool.pop(0)
-        self.laser_pool.append(laser_msg.ranges)
+        self.laser_pool.append(cur_laser)
 
     def _path_callback(self, global_path_msg):
         self.global_plan = global_path_msg
 
     def _imu_callback(self, msg: Imu):
         self.imu = msg
+
+    def _setup_scene(self):
+        self.world = World(stage_units_in_meters=1.0, physics_dt=0.05, rendering_dt=0.05)
+        assets_root_path = get_assets_root_path()
+        asset_path = assets_root_path + "/Isaac/Robots/Carter/carter_v1.usd"
+        wheel_dof_names = ["left_wheel", "right_wheel"]
+        self.robot = self.world.scene.add(
+            WheeledRobot(
+                prim_path="/World/Carters/Carter_0",
+                name="Carter_0",
+                wheel_dof_names=wheel_dof_names,
+                create_robot=True,
+                usd_path=asset_path,
+                position=np.array([1.5, 1.5, 0.3]),
+                orientation=np.array([np.cos(1.0), 0.0, 0.0, 0.0])
+            )
+        )
+        self.lidar_path = "/World/Carters/Carter_0/chassis_link/lidar"
+        self.carter_lidar = self.world.scene.add(
+            RotatingLidarPhysX(
+                prim_path=self.lidar_path,
+                name="lidar",
+                rotation_frequency=0,
+                translation=np.array([-0.06, 0, 0.38]),
+                fov=(270, 0.0), resolution=(0.25, 0.0),
+                valid_range=(0.4, 10.0)
+            )
+        )
+        self.lidarInterface = _range_sensor.acquire_lidar_sensor_interface()
+        self.controller = DifferentialController(name="simple_control", wheel_radius=0.24, wheel_base=0.56)
+        env_usd_path = f"/home/{linux_user}/isaac_sim_ws/src/isaac_sim/isaac/hospital.usd"
+        add_reference_to_stage(usd_path=env_usd_path, prim_path="/World/Envs/Env_0")
+        self.world.scene.add(
+            GeometryPrim(
+                prim_path="/World/Envs/Env_0",
+                name="Env",
+                collision=True,
+                position=np.array([0.0, 0.0, 0.0]),
+                orientation=np.array([1.0, 0.0, 0.0, 0.0])
+            )
+        )
+        self.world.reset()
 
 
 def load_network_parameters(net_model):
@@ -464,13 +442,13 @@ if __name__ == "__main__":
                 learning_starts=0,
                 tensorboard_log=save_log_dir,
                 policy_kwargs=policy_kwargs,
-                device="cuda")
+                device="cuda:1")
     load_network_parameters(model.policy)
     save_model_callback = SaveOnBestTrainingRewardCallback(check_freq=1024, log_dir=save_log_dir, verbose=2)
     reward_callback = RewardCallback(verbose=2)
     callback_list = CallbackList([save_model_callback, reward_callback])
     model.learn(total_timesteps=200000,
-                log_interval=1,  # episodes interval of log
+                log_interval=2,  # episodes interval of log
                 tb_log_name='drl_policy',
                 reset_num_timesteps=True,
                 callback=callback_list)
