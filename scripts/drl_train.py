@@ -42,11 +42,13 @@ import numpy as np
 # ROS
 import rospy
 from actionlib import SimpleActionClient
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from gymnasium.utils import seeding
 from nav_msgs.msg import OccupancyGrid, Path
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, LaserScan
 from isaac_sim.msg import PlanAction, PlanGoal, PlanResult
+from tf2_ros import TransformBroadcaster
+from actionlib_msgs.msg import GoalStatus
 
 # Stable-baseline3
 from stable_baselines3.common.callbacks import CallbackList
@@ -54,6 +56,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.sac import SAC
 from stable_baselines3.sac.policies import SACPolicy
 
+# customer code
 from parameters import *
 from pose_utils import PoseUtils, get_yaw, get_distance_from_path
 from transformer_drl_network import TransformerFeatureExtractor
@@ -102,7 +105,6 @@ class SimpleEnv(gym.Env):
         # private variable
         self.global_plan = Path()
         self.map = OccupancyGrid()
-        self.imu = Imu()
         self.laser_pool = []
         self.training_state = TrainingState.TRAINING
         self.num_iterations = 0
@@ -112,22 +114,28 @@ class SimpleEnv(gym.Env):
         self.last_pose = None
         self.robot_trapped = 0
         self.last_global_plan_length = None
-        self.explore_punish_pool = []
         self.entire_distance = 0
         self.last_geodesic_distance = 0
+        self.robot_pose = PoseStamped()
 
         # ros
         self._map_sub = rospy.Subscriber("/map", OccupancyGrid, self._map_callback, queue_size=1)
         self._plan_client = SimpleActionClient("/plan", PlanAction)
         self._pose_pub = rospy.Publisher("/robot_pose", PoseStamped, queue_size=1)
+        self._scan_pub = rospy.Publisher("/scan", LaserScan, queue_size=1)
+        self._tf_br = TransformBroadcaster()
 
     # Observation, Reward, terminated, truncated, info
     def step(self, action):
         self.pbar.update()
+        if np.nan in action:
+            rospy.logfatal(f"neural network calculated an unexpected value(nan)")
         forward = np.clip(action[0], min_vel_x, max_vel_x)
         angular = np.clip(action[1], min_vel_z, max_vel_z)
         self.robot.apply_wheel_actions(self.controller.forward(command=np.array([forward, angular])))
-        self.world.step(render=False)
+        self.world.step()
+        self.robot_pose = self._make_pose()
+        self._publish_tf()
         plan = self._make_plan()
         observations = self._get_observation(plan)
         state = self._is_done()
@@ -141,7 +149,7 @@ class SimpleEnv(gym.Env):
 
         # clear the buffer before resetting
         self.robot.apply_wheel_actions(self.controller.forward(command=np.array([0.0, 0.0])))
-        self.world.step(render=False)
+        self.world.step()
         self.world.reset()
         self.laser_pool.clear()
 
@@ -152,13 +160,13 @@ class SimpleEnv(gym.Env):
         position = np.array([x, y, 0.3])
         orientation = np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
         self.robot.set_world_pose(position=position, orientation=orientation)
-        self.world.step(render=False)
+        self.world.step()
         time.sleep(2.0)
-
+        self.robot_pose = self._make_pose()
+        self._publish_tf()
         plan = self._make_plan()
 
         # reset variables
-        # noinspection PyTypeChecker
         self.entire_distance = get_distance_from_path(self.global_plan)
         self.last_geodesic_distance = self.entire_distance
         self.last_pose = init_pose
@@ -167,7 +175,6 @@ class SimpleEnv(gym.Env):
         self.collision_times = 0
         self.robot_trapped = 0
         self.last_global_plan_length = None
-        self.explore_punish_pool.clear()
         self.pbar.reset()
 
         return self._get_observation(plan), {}
@@ -185,7 +192,7 @@ class SimpleEnv(gym.Env):
     def _make_plan(self):
         goal = PlanGoal()
         goal.target = self.target
-        start_pose = self._make_pose()
+        start_pose = self.robot_pose
         start_pose.header.frame_id = "map"
         start_pose.header.stamp = rospy.Time.now()
         goal.target.header.frame_id = "map"
@@ -193,8 +200,9 @@ class SimpleEnv(gym.Env):
         goal.start = start_pose
         self._pose_pub.publish(start_pose)
         self._plan_client.send_goal_and_wait(goal)
-        result = self._plan_client.get_result()
-        return result
+        if self._plan_client.get_state() == GoalStatus.SUCCEEDED:
+            result = self._plan_client.get_result()
+            return result
 
     def _wait_for_map(self):
         while True:
@@ -206,13 +214,16 @@ class SimpleEnv(gym.Env):
 
     def _get_observation(self, plan: PlanResult):
         # goal
-        robot_pose = self.robot.get_world_pose()
-        goal = np.array((
-            self.target.pose.position.x - robot_pose[0][0],
-            self.target.pose.position.y - robot_pose[0][1],
-            angles.normalize_angle(
-                get_yaw(self.target.pose.orientation) - angles.normalize_angle(math.acos(robot_pose[1][0]) * 2)
-            )))
+        robot_pose = self.robot_pose
+        dx = self.target.pose.position.x - robot_pose.pose.position.x
+        dy = self.target.pose.position.y - robot_pose.pose.position.y
+        cos_yaw = math.cos(get_yaw(robot_pose.pose.orientation))
+        sin_yaw = -math.sin(get_yaw(robot_pose.pose.orientation))
+        goal = np.array([
+            dx * cos_yaw - dy * sin_yaw,
+            dx * sin_yaw + dy * cos_yaw,
+            angles.normalize_angle(get_yaw(self.target.pose.orientation) - get_yaw(robot_pose.pose.orientation))
+        ])
 
         # global plan
         assert isinstance(self.global_plan, Path)
@@ -295,7 +306,7 @@ class SimpleEnv(gym.Env):
 
     def _is_done(self):
         # 1) Goal reached?
-        curr_pose = self._make_pose()
+        curr_pose = self.robot_pose
         dist_to_goal = np.linalg.norm(
             np.array([
                 curr_pose.pose.position.x - self.target.pose.position.x,
@@ -347,16 +358,34 @@ class SimpleEnv(gym.Env):
         return pose
 
     def _store_laser(self):
-        cur_laser = self.lidarInterface.get_linear_depth_data(self.lidar_path)[:, 1]
+        cur_laser = self.lidarInterface.get_linear_depth_data(self.lidar_path)[:, 0]
+        self._publish_scan(cur_laser)
         if len(self.laser_pool) >= self.laser_pool_capacity:
             self.laser_pool.pop(0)
         self.laser_pool.append(cur_laser)
 
-    def _path_callback(self, global_path_msg):
-        self.global_plan = global_path_msg
+    def _publish_tf(self):
+        transform = TransformStamped()
+        transform.header.stamp = rospy.Time.now()
+        transform.header.frame_id = self.map_frame
+        transform.child_frame_id = self.robot_frame
+        transform.transform.translation.x = self.robot_pose.pose.position.x
+        transform.transform.translation.y = self.robot_pose.pose.position.y
+        transform.transform.translation.z = self.robot_pose.pose.position.z
+        transform.transform.rotation = self.robot_pose.pose.orientation
+        self._tf_br.sendTransform(transform)
 
-    def _imu_callback(self, msg: Imu):
-        self.imu = msg
+    def _publish_scan(self, ranges):
+        scan = LaserScan()
+        scan.header.frame_id = self.robot_frame
+        scan.header.stamp = rospy.Time.now()
+        scan.range_max = 10.0
+        scan.range_min = 0.4
+        scan.ranges = ranges
+        scan.angle_min = - 3 * math.pi / 4
+        scan.angle_max = 3 * math.pi / 4
+        scan.angle_increment = 0.25 * math.pi / 180
+        self._scan_pub.publish(scan)
 
     def _setup_scene(self):
         self.world = World(stage_units_in_meters=1.0, physics_dt=0.05, rendering_dt=0.05)
@@ -420,6 +449,10 @@ def load_network_parameters(net_model):
     net_model.actor.latent_pi.load_state_dict(mlp_extractor_param)
     net_model.actor.mu.load_state_dict(action_net_param)
     net_model.critic.features_extractor.load_state_dict(feature_extractor_param)
+    # net_model.actor.features_extractor.requires_grad_(False)
+    # net_model.actor.features_extractor.dense.requires_grad_(True)
+    # net_model.critic.features_extractor.requires_grad_(False)
+    # net_model.critic.features_extractor.dense.requires_grad_(True)
 
 
 if __name__ == "__main__":
@@ -428,16 +461,15 @@ if __name__ == "__main__":
     policy_kwargs = dict(
         features_extractor_class=TransformerFeatureExtractor,
         features_extractor_kwargs=dict(features_dim=512),
+        share_features_extractor=True,
         net_arch=dict(pi=[256], qf=[128]),
         optimizer_class=torch.optim.Adam,
-        optimizer_kwargs=dict(
-            weight_decay=0.00001
-        )
+        optimizer_kwargs=dict(weight_decay=0.00001),
     )
     model = SAC(SACPolicy,
                 env=env,
-                buffer_size=100_000,
-                learning_rate=1e-5,
+                buffer_size=200_000,
+                learning_rate=5e-6,
                 batch_size=256,
                 learning_starts=0,
                 tensorboard_log=save_log_dir,
@@ -445,9 +477,9 @@ if __name__ == "__main__":
                 device="cuda:1")
     load_network_parameters(model.policy)
     save_model_callback = SaveOnBestTrainingRewardCallback(check_freq=1024, log_dir=save_log_dir, verbose=2)
-    reward_callback = RewardCallback(verbose=2)
+    reward_callback = RewardCallback(check_freq=16, verbose=2)
     callback_list = CallbackList([save_model_callback, reward_callback])
-    model.learn(total_timesteps=200000,
+    model.learn(total_timesteps=500_000,
                 log_interval=2,  # episodes interval of log
                 tb_log_name='drl_policy',
                 reset_num_timesteps=True,
