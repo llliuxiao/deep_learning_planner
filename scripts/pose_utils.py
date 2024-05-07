@@ -33,6 +33,15 @@ def get_distance_from_path(path: Path):
     return distance
 
 
+def calculate_geodesic_distance(path):
+    distance = 0
+    for i in range(len(path) - 1):
+        dx = path[i + 1, 0] - path[i, 0]
+        dy = path[i + 1, 1] - path[i, 1]
+        distance += math.sqrt(dx * dx + dy * dy)
+    return distance
+
+
 class PoseUtils:
     def __init__(self, robot_radius, scene=None):
         self.buffer = Buffer()

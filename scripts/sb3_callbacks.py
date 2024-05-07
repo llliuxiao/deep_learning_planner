@@ -41,15 +41,13 @@ class SaveOnBestTrainingRewardCallback(BaseCallback):
 
 
 class RewardCallback(BaseCallback):
-    def __init__(self, check_freq: int, verbose=1):
+    def __init__(self, verbose=1):
         super(RewardCallback, self).__init__(verbose)
-        self.check_freq = check_freq
 
     def _on_step(self):
-        if self.n_calls % self.check_freq == 0:
-            infos = self.locals.get('infos')
-            if infos is not None:
-                self.logger.record('train/arrival_rew', np.mean([info['arrival'] for info in infos]))
-                self.logger.record('train/collision_rew', np.mean([info['collision'] for info in infos]))
-                self.logger.record('train/angular_rew', np.mean([info['angular'] for info in infos]))
+        infos = self.locals.get('infos')
+        if infos is not None:
+            self.logger.record('Train/arrival_rew', np.mean([info['arrival'] for info in infos]))
+            self.logger.record('Train/collision_rew', np.mean([info['collision'] for info in infos]))
+            self.logger.record('Train/angular_rew', np.mean([info['angular'] for info in infos]))
         return True
