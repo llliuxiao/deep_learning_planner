@@ -47,7 +47,30 @@ class RewardCallback(BaseCallback):
     def _on_step(self):
         infos = self.locals.get('infos')
         if infos is not None:
-            self.logger.record('Train/arrival_rew', np.mean([info['arrival'] for info in infos]))
-            self.logger.record('Train/collision_rew', np.mean([info['collision'] for info in infos]))
-            self.logger.record('Train/angular_rew', np.mean([info['angular'] for info in infos]))
+            self.logger.record_mean('Train/arrival_rew', np.mean([info['arrival'] for info in infos]))
+            self.logger.record_mean('Train/collision_rew', np.mean([info['collision'] for info in infos]))
+            self.logger.record_mean('Train/angular_rew', np.mean([info['angular'] for info in infos]))
         return True
+
+# class RewardCallback(BaseCallback):
+#     def __init__(self, verbose=1, interval=256):
+#         super(RewardCallback, self).__init__(verbose)
+#         self.arrival_rew = []
+#         self.collision_rew = []
+#         self.angular_rew = []
+#         self.interval = interval
+#
+#     def _on_step(self):
+#         infos = self.locals.get('infos')
+#         self.arrival_rew.append(np.mean([info['arrival'] for info in infos]))
+#         self.collision_rew.append(np.mean([info['collision'] for info in infos]))
+#         self.angular_rew.append(np.mean([info['angular'] for info in infos]))
+#         if len(self.angular_rew) == self.interval:
+#             self.logger.record('Train/arrival_rew', np.mean(self.arrival_rew))
+#             self.logger.record('Train/collision_rew', np.mean(self.collision_rew))
+#             self.logger.record('Train/angular_rew', np.mean(self.angular_rew))
+#             self.angular_rew.clear()
+#             self.collision_rew.clear()
+#             self.arrival_rew.clear()
+#         return True
+

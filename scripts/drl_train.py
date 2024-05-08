@@ -42,7 +42,7 @@ import numpy as np
 # ROS
 import rospy
 from actionlib import SimpleActionClient
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from gymnasium.utils import seeding
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
@@ -122,6 +122,7 @@ class SimpleEnv(gym.Env):
         self._scan_pub = rospy.Publisher("/scan", LaserScan, queue_size=1)
         self._clear_costmap_client = rospy.ServiceProxy("/clear_costmap", Empty)
         self._goal_pub = rospy.Publisher("/goal", PoseStamped, queue_size=1)
+        self._cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
         self._tf_br = TransformBroadcaster()
 
     # Observation, Reward, terminated, truncated, info
@@ -131,6 +132,10 @@ class SimpleEnv(gym.Env):
             rospy.logfatal(f"neural network calculated an unexpected value(nan)")
         forward = np.clip(action[0], min_vel_x, max_vel_x)
         angular = np.clip(action[1], min_vel_z, max_vel_z)
+        cmd_vel = Twist()
+        cmd_vel.linear.x = forward
+        cmd_vel.angular.z = angular
+        self._cmd_vel_pub.publish(cmd_vel)
         self.robot.apply_wheel_actions(self.controller.forward(command=np.array([forward, angular])))
         self.world.step()
         self.robot_pose = self._make_pose()
@@ -237,21 +242,14 @@ class SimpleEnv(gym.Env):
                 lasers[laser_length - i - 1] = self.laser_pool[prefix]
 
         # global plan
-        count = 0
-        while True:
-            plan = self._make_plan()
-            if plan is not None:
-                break
-            else:
-                count += 1
-                if count >= 10:
-                    return {
-                        "laser": np.array(lasers) / laser_range,
-                        "global_plan": np.zeros(shape=(20, 3)),
-                        "goal": goal / np.array([look_ahead_distance, look_ahead_distance, np.pi]),
-                    }
-                rospy.logerr("could not get a global plan")
-                self._clear_costmap_client()
+        plan = self._make_plan()
+        if plan is None:
+            rospy.logerr("could not get a global plan")
+            return {
+                "laser": np.array(lasers) / laser_range,
+                "global_plan": np.zeros(shape=(20, 3)),
+                "goal": goal / np.array([look_ahead_distance, look_ahead_distance, np.pi]),
+            }
         self.global_plan = np.array([plan.x, plan.y, plan.yaw]).T
         if len(self.global_plan) > 0:
             global_plan = self.global_plan[:min(len(self.global_plan), look_ahead_poses * down_sample):down_sample, :]
@@ -278,7 +276,7 @@ class SimpleEnv(gym.Env):
         r_waypoint = 3.2
         r_collision = -20
         r_scan = -0.2
-        r_rotation = -0.1
+        r_rotation = -1.0
 
         w_thresh = 0.7
 
@@ -343,7 +341,7 @@ class SimpleEnv(gym.Env):
                                    math.pow(self.last_pose.pose.position.y - curr_pose.pose.position.y, 2))
         delta_angle = abs(angles.normalize_angle(get_yaw(curr_pose.pose.orientation) -
                                                  get_yaw(self.last_pose.pose.orientation)))
-        if delta_distance <= 0.05 and delta_angle <= 0.05 and min(self.laser_pool[-1]) <= robot_radius:
+        if delta_distance <= 0.01 and delta_angle <= 0.01:
             self.robot_trapped += 1
         else:
             self.robot_trapped = 0
@@ -476,10 +474,6 @@ def load_network_parameters(net_model):
     net_model.actor.latent_pi.load_state_dict(mlp_extractor_param)
     net_model.actor.mu.load_state_dict(action_net_param)
     net_model.critic.features_extractor.load_state_dict(feature_extractor_param)
-    # net_model.actor.features_extractor.requires_grad_(False)
-    # net_model.actor.features_extractor.dense.requires_grad_(True)
-    # net_model.critic.features_extractor.requires_grad_(False)
-    # net_model.critic.features_extractor.dense.requires_grad_(True)
 
 
 if __name__ == "__main__":
@@ -495,7 +489,7 @@ if __name__ == "__main__":
     )
     model = SAC(SACPolicy,
                 env=env,
-                buffer_size=200_000,
+                buffer_size=500_000,
                 learning_rate=5e-6,
                 batch_size=256,
                 learning_starts=0,
@@ -506,7 +500,7 @@ if __name__ == "__main__":
     save_model_callback = SaveOnBestTrainingRewardCallback(check_freq=1024, log_dir=save_log_dir, verbose=2)
     reward_callback = RewardCallback(verbose=2)
     callback_list = CallbackList([save_model_callback, reward_callback])
-    model.learn(total_timesteps=500_000,
+    model.learn(total_timesteps=1_000_000,
                 log_interval=2,  # episodes interval of log
                 tb_log_name='drl_policy',
                 reset_num_timesteps=True,
