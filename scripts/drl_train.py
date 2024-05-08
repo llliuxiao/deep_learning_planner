@@ -55,13 +55,12 @@ from deep_learning_planner.msg import RewardFunction
 # Stable-baseline3
 from stable_baselines3.common.callbacks import CallbackList
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.sac import SAC
-from stable_baselines3.sac.policies import SACPolicy
+from stable_baselines3.ppo import PPO
 
 # customer code
 from parameters import *
 from pose_utils import PoseUtils, get_yaw, get_roll, get_pitch, calculate_geodesic_distance
-from transformer_drl_network import TransformerFeatureExtractor
+from transformer_drl_network import TransformerFeatureExtractor, CustomActorCriticPolicy
 from sb3_callbacks import SaveOnBestTrainingRewardCallback, RewardCallback
 
 save_log_dir = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs"
@@ -480,10 +479,9 @@ def load_network_parameters(net_model):
         else:
             new_k = k.replace("module.", "")
             feature_extractor_param[new_k] = v
-    net_model.actor.features_extractor.load_state_dict(feature_extractor_param)
-    net_model.actor.latent_pi.load_state_dict(mlp_extractor_param)
-    net_model.actor.mu.load_state_dict(action_net_param)
-    net_model.critic.features_extractor.load_state_dict(feature_extractor_param)
+    net_model.features_extractor.load_state_dict(feature_extractor_param)
+    net_model.mlp_extractor.mlp_extractor_actor.load_state_dict(mlp_extractor_param)
+    net_model.action_net.load_state_dict(action_net_param)
 
 
 if __name__ == "__main__":
@@ -492,26 +490,27 @@ if __name__ == "__main__":
     policy_kwargs = dict(
         features_extractor_class=TransformerFeatureExtractor,
         features_extractor_kwargs=dict(features_dim=512),
-        share_features_extractor=True,
         net_arch=dict(pi=[256], qf=[128]),
-        optimizer_class=torch.optim.Adam,
         optimizer_kwargs=dict(weight_decay=0.00001),
+        log_std_init=-2,
     )
-    model = SAC(SACPolicy,
+    model = PPO(CustomActorCriticPolicy,  # ?
                 env=env,
-                buffer_size=500_000,
+                verbose=2,  # similar to log level
                 learning_rate=5e-6,
                 batch_size=256,
-                learning_starts=0,
                 tensorboard_log=save_log_dir,
+                n_epochs=10,
+                n_steps=512,
+                gamma=0.99,
                 policy_kwargs=policy_kwargs,
-                device="cuda:1")
+                device=torch.device("cuda:1"))
     load_network_parameters(model.policy)
     save_model_callback = SaveOnBestTrainingRewardCallback(check_freq=1024, log_dir=save_log_dir, verbose=2)
     reward_callback = RewardCallback(verbose=2)
     callback_list = CallbackList([save_model_callback, reward_callback])
-    model.learn(total_timesteps=1_000_000,
-                log_interval=2,  # episodes interval of log
+    model.learn(total_timesteps=1000_000,
+                log_interval=5,  # episodes interval of log
                 tb_log_name='drl_policy',
                 reset_num_timesteps=True,
                 callback=callback_list)
