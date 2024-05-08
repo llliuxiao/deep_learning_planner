@@ -22,7 +22,7 @@ from tf2_ros.transform_listener import TransformListener
 from transformer_network import RobotTransformer
 from parameters import *
 
-model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model7/best.pth"
+model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model9/best.pth"
 
 
 class TransformerPlanner:
@@ -104,7 +104,7 @@ class TransformerPlanner:
         for i in range(laser_length - 1, 0, -1):
             prefix = len(self.laser_pool) - i * interval
             if prefix < 0:
-                continue
+                lasers[laser_length - i - 1] = self.laser_pool[0]
             else:
                 lasers[laser_length - i - 1] = self.laser_pool[prefix]
         laser_tensor = torch.tensor(lasers, dtype=torch.float)
@@ -177,8 +177,8 @@ class TransformerPlanner:
         with torch.no_grad():
             predict = self.model(laser_tensor, global_plan_tensor, goal_tensor, laser_mask)
         predict = torch.squeeze(predict)
-        cmd_vel.linear.x = self.velocity_factor * predict[0].item() * (max_vel_x - min_vel_x) + min_vel_x
-        cmd_vel.angular.z = self.velocity_factor * predict[1].item() * (max_vel_z - min_vel_z) + min_vel_z
+        cmd_vel.linear.x = self.velocity_factor * predict[0].item()
+        cmd_vel.angular.z = self.velocity_factor * predict[1].item()
         distance = self.get_distance_to_goal()
         assert isinstance(self.global_plan, Path)
         if distance <= goal_radius and len(self.global_plan.poses) < 10:

@@ -93,7 +93,7 @@ class SimpleEnv(gym.Env):
 
         # reinforcement learning global variable
         self.num_envs = 1
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=float)
+        self.action_space = spaces.Box(low=np.array([0.0, -1.0]), high=np.array([1.0, 1.0]), shape=(2,), dtype=float)
         self.observation_space = spaces.Dict({
             "laser": spaces.Box(low=0., high=1.0, shape=(6, 1080), dtype=float),
             "global_plan": spaces.Box(low=-1., high=1., shape=(20, 3), dtype=float),
@@ -112,7 +112,6 @@ class SimpleEnv(gym.Env):
         self.pbar = tqdm.tqdm(total=max_iteration)
         self.last_pose = None
         self.robot_trapped = 0
-        self.entire_distance = 0
         self.last_geodesic_distance = 0
         self.robot_pose = PoseStamped()
 
@@ -170,15 +169,16 @@ class SimpleEnv(gym.Env):
         self._publish_tf()
         self._clear_costmap_client()
 
+        observations = self._get_observation()
+
         # reset variables
-        self.last_geodesic_distance = self.entire_distance
+        self.last_geodesic_distance = calculate_geodesic_distance(self.global_plan)
         self.last_pose = init_pose
         self.training_state = TrainingState.TRAINING
         self.num_iterations = 0
         self.robot_trapped = 0
         self.pbar.reset()
-
-        return self._get_observation(), {}
+        return observations, {}
 
     def close(self):
         rospy.logfatal("Closing IsaacSim Simulator")
@@ -252,8 +252,7 @@ class SimpleEnv(gym.Env):
                     }
                 rospy.logerr("could not get a global plan")
                 self._clear_costmap_client()
-        self.global_plan = np.array([plan.x, plan.y, plan.yaw]).reshape((-1, 3))
-        self.entire_distance = calculate_geodesic_distance(self.global_plan)
+        self.global_plan = np.array([plan.x, plan.y, plan.yaw]).T
         if len(self.global_plan) > 0:
             global_plan = self.global_plan[:min(len(self.global_plan), look_ahead_poses * down_sample):down_sample, :]
             if len(global_plan) < look_ahead_poses:
@@ -344,7 +343,7 @@ class SimpleEnv(gym.Env):
                                    math.pow(self.last_pose.pose.position.y - curr_pose.pose.position.y, 2))
         delta_angle = abs(angles.normalize_angle(get_yaw(curr_pose.pose.orientation) -
                                                  get_yaw(self.last_pose.pose.orientation)))
-        if delta_distance <= 0.05 and delta_angle <= 0.05 and min(self.laser_pool[-1]) <= 2 * robot_radius:
+        if delta_distance <= 0.05 and delta_angle <= 0.05 and min(self.laser_pool[-1]) <= robot_radius:
             self.robot_trapped += 1
         else:
             self.robot_trapped = 0

@@ -54,7 +54,7 @@ class RobotTransformerDataset(Dataset):
         for i in range(laser_length - 1, 0, -1):
             prefix = step_prefix - i * interval
             if prefix < 0:
-                continue
+                meta_data.laser_path[laser_length - i - 1] = step_data[0]["laser_path"]
             else:
                 meta_data.laser_path[laser_length - i - 1] = step_data[prefix]["laser_path"]
         self.data_info.append(meta_data)

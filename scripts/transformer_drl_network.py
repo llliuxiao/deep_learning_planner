@@ -13,40 +13,6 @@ from transformer_network import Transformer, PositionalEncoding
 from parameters import *
 
 
-class RLRobotTransformer(nn.Module):
-    def __init__(self,
-                 feature_dim,
-                 last_layer_dim_pi: int = 256,
-                 last_layer_dim_vf: int = 128):
-        super().__init__()
-
-        self.latent_dim_pi = last_layer_dim_pi
-        self.latent_dim_vf = last_layer_dim_vf
-        self.global_plan_pre = nn.Linear(3, 256)
-        self.position_encoding = PositionalEncoding(d_model=256, max_seq_len=20)
-        self.global_plan_transformer = Transformer(dim=256, dim_head=64,
-                                                   heads=4, depth=4,
-                                                   attn_dropout=0.1, ff_dropout=0.1)
-        self.dense = nn.Sequential(
-            nn.Linear(256 + 3, 512), nn.ReLU(),
-        )
-        self.mlp_extractor_actor = nn.Sequential(nn.Linear(512, 256), nn.ReLU())
-        self.mlp_extractor_critic = nn.Sequential(nn.Linear(512, 128), nn.ReLU())
-        self.action_net = nn.Sequential(nn.Linear(256, 2), nn.Softplus())
-        self.value_net = nn.Sequential(nn.Linear(128, 1))
-
-    def forward(self, obs):
-        global_plan = obs["global_plan"]
-        goal = obs["goal"]
-        high_dim_global_plan = self.global_plan_pre(global_plan)
-        position_encoding = self.position_encoding(high_dim_global_plan)
-        attended_global_plan = self.global_plan_transformer(position_encoding)
-        global_plan_token = reduce(attended_global_plan, 'b f d -> b d', 'mean')
-        tensor = torch.concat((global_plan_token, goal), dim=1)
-        feature = self.dense(tensor)
-        return self.action_net(self.mlp_extractor_actor(feature)), self.value_net(self.mlp_extractor_value(feature))
-
-
 class CustomMlpExtractor(nn.Module):
     def __init__(self,
                  feature_dim,
@@ -91,7 +57,6 @@ class CustomActorCriticPolicy(ActorCriticPolicy):
 
     def _get_action_dist_from_latent(self, latent_pi: torch.Tensor) -> Distribution:
         mean_actions = self.action_net(latent_pi)
-        mean_actions = nn.functional.softplus(mean_actions)
         return self.action_dist.proba_distribution(mean_actions, self.log_std)
 
     def forward(self, obs: torch.Tensor, deterministic: bool = False):
@@ -115,7 +80,7 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim)
         self.latent_dim_pi = 256
         self.latent_dim_vf = 128
-        self.laser_mask = torch.triu(torch.ones((laser_length, laser_length), dtype=torch.bool), 1).to("cuda")
+        self.laser_mask = torch.triu(torch.ones((laser_length, laser_length), dtype=torch.bool), 1).to("cuda:1")
         # laser
         self.laser_pre = nn.Linear(1080, 512)
         self.laser_position_encoding = PositionalEncoding(d_model=512, max_seq_len=6)
