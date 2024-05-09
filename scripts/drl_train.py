@@ -50,6 +50,8 @@ from isaac_sim.msg import PlanAction, PlanGoal, PlanResult
 from tf2_ros import TransformBroadcaster
 from actionlib_msgs.msg import GoalStatus
 from std_srvs.srv import Empty
+from deep_learning_planner.msg import RewardFunction
+
 
 # Stable-baseline3
 from stable_baselines3.common.callbacks import CallbackList
@@ -123,6 +125,7 @@ class SimpleEnv(gym.Env):
         self._clear_costmap_client = rospy.ServiceProxy("/clear_costmap", Empty)
         self._goal_pub = rospy.Publisher("/goal", PoseStamped, queue_size=1)
         self._cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+        self._reward_pub = rospy.Publisher("/reward", RewardFunction, queue_size=1)
         self._tf_br = TransformBroadcaster()
 
     # Observation, Reward, terminated, truncated, info
@@ -245,12 +248,9 @@ class SimpleEnv(gym.Env):
         plan = self._make_plan()
         if plan is None:
             rospy.logerr("could not get a global plan")
-            return {
-                "laser": np.array(lasers) / laser_range,
-                "global_plan": np.zeros(shape=(20, 3)),
-                "goal": goal / np.array([look_ahead_distance, look_ahead_distance, np.pi]),
-            }
-        self.global_plan = np.array([plan.x, plan.y, plan.yaw]).T
+            self._clear_costmap_client()
+        else:
+            self.global_plan = np.array([plan.x, plan.y, plan.yaw]).T
         if len(self.global_plan) > 0:
             global_plan = self.global_plan[:min(len(self.global_plan), look_ahead_poses * down_sample):down_sample, :]
             if len(global_plan) < look_ahead_poses:
@@ -276,14 +276,14 @@ class SimpleEnv(gym.Env):
         r_waypoint = 3.2
         r_collision = -20
         r_scan = -0.2
-        r_rotation = -1.0
+        r_rotation = -0.1
 
         w_thresh = 0.7
 
         reward = 0
+        reward_func = RewardFunction()
 
         linear, angular = action
-        laser = observation["laser"]
 
         # reach the goal reward
         if self.training_state == TrainingState.REACHED:
@@ -296,24 +296,28 @@ class SimpleEnv(gym.Env):
             self.last_geodesic_distance = geodesic_distance
         reward += reward_arrival
         info["arrival"] = reward_arrival
+        reward_func.arrival_reward = reward_arrival
 
         # obstacle reward
         reward_collision = 0
         if self.training_state == TrainingState.COLLISION:
             reward_collision = r_collision
         else:
-            min_distance = np.min(laser[-1])
+            min_distance = np.min(self.laser_pool[-1])
             if min_distance < 3 * robot_radius:
                 reward_collision = r_scan * (3 * robot_radius - min_distance)
         info["collision"] = reward_collision
         reward += reward_collision
+        reward_func.collision_reward = reward_collision
 
         # angular velocity punish
         info["angular"] = 0
         if abs(angular) >= w_thresh:
             reward = abs(angular) * r_rotation
             info["angular"] = abs(angular) * r_rotation
-
+            reward_func.angular_reward = abs(angular) * r_rotation
+        reward_func.total_reward = reward
+        self._reward_pub.publish(reward_func)
         # theta reward
         return reward, info
 
@@ -341,7 +345,7 @@ class SimpleEnv(gym.Env):
                                    math.pow(self.last_pose.pose.position.y - curr_pose.pose.position.y, 2))
         delta_angle = abs(angles.normalize_angle(get_yaw(curr_pose.pose.orientation) -
                                                  get_yaw(self.last_pose.pose.orientation)))
-        if delta_distance <= 0.01 and delta_angle <= 0.01:
+        if (delta_distance <= 0.01 and delta_angle <= 0.01) or min(self.laser_pool[-1]) < 0.4:
             self.robot_trapped += 1
         else:
             self.robot_trapped = 0
