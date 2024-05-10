@@ -47,9 +47,11 @@ class RewardCallback(BaseCallback):
     def _on_step(self):
         infos = self.locals.get('infos')
         if infos is not None:
-            self.logger.record_mean('Train/arrival_rew', np.mean([info['arrival'] for info in infos]))
-            self.logger.record_mean('Train/collision_rew', np.mean([info['collision'] for info in infos]))
-            self.logger.record_mean('Train/angular_rew', np.mean([info['angular'] for info in infos]))
+            self.logger.record_mean('Reward/arrival_rew', np.mean([info['arrival'] for info in infos]))
+            self.logger.record_mean('Reward/collision_rew', np.mean([info['collision'] for info in infos]))
+            self.logger.record_mean('Reward/angular_rew', np.mean([info['angular'] for info in infos]))
+            self.logger.record_mean("Reward/direction_rew", np.mean([info["direction"] for info in infos]))
+            self.logger.record_mean("Reward/total_rew", np.mean([info["reward"] for info in infos]))
         return True
 
 # class RewardCallback(BaseCallback):

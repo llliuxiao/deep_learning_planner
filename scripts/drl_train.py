@@ -1,3 +1,4 @@
+import math
 import os
 
 from omni.isaac.kit import SimulationApp
@@ -23,7 +24,6 @@ from omni.isaac.core.utils.nucleus import get_assets_root_path
 
 # utils
 import enum
-import math
 import os
 import re
 import time
@@ -52,7 +52,6 @@ from actionlib_msgs.msg import GoalStatus
 from std_srvs.srv import Empty
 from deep_learning_planner.msg import RewardFunction
 
-
 # Stable-baseline3
 from stable_baselines3.common.callbacks import CallbackList
 from stable_baselines3.common.monitor import Monitor
@@ -61,7 +60,7 @@ from stable_baselines3.sac.policies import SACPolicy
 
 # customer code
 from parameters import *
-from pose_utils import PoseUtils, get_yaw, calculate_geodesic_distance
+from pose_utils import PoseUtils, get_yaw, get_roll, get_pitch, calculate_geodesic_distance
 from transformer_drl_network import TransformerFeatureExtractor
 from sb3_callbacks import SaveOnBestTrainingRewardCallback, RewardCallback
 
@@ -80,7 +79,7 @@ class TrainingState(enum.Enum):
     TRAINING = 4
 
 
-class SimpleEnv(gym.Env):
+class Environment(gym.Env):
     def __init__(self):
         # Random seeds
         self.seed()
@@ -122,7 +121,7 @@ class SimpleEnv(gym.Env):
         self._plan_client = SimpleActionClient("/plan", PlanAction)
         self._pose_pub = rospy.Publisher("/robot_pose", PoseStamped, queue_size=1)
         self._scan_pub = rospy.Publisher("/scan", LaserScan, queue_size=1)
-        self._clear_costmap_client = rospy.ServiceProxy("/clear_costmap", Empty)
+        self._clear_costmap_client = rospy.ServiceProxy("/clear", Empty)
         self._goal_pub = rospy.Publisher("/goal", PoseStamped, queue_size=1)
         self._cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
         self._reward_pub = rospy.Publisher("/reward", RewardFunction, queue_size=1)
@@ -141,7 +140,7 @@ class SimpleEnv(gym.Env):
         self._cmd_vel_pub.publish(cmd_vel)
         self.robot.apply_wheel_actions(self.controller.forward(command=np.array([forward, angular])))
         self.world.step()
-        self.robot_pose = self._make_pose()
+        self.robot_pose = self._make_robot_pose()
         self._publish_tf()
         state = self._is_done()
         observations = self._get_observation()
@@ -173,7 +172,7 @@ class SimpleEnv(gym.Env):
         self.target.header.stamp = rospy.Time.now()
         self.target.header.frame_id = self.map_frame
         self._goal_pub.publish(self.target)
-        self.robot_pose = self._make_pose()
+        self.robot_pose = self._make_robot_pose()
         self._publish_tf()
         self._clear_costmap_client()
 
@@ -201,7 +200,7 @@ class SimpleEnv(gym.Env):
     def _make_plan(self):
         goal = PlanGoal()
         goal.target = self.target
-        start_pose = self._make_pose()
+        start_pose = self._make_robot_pose()
         start_pose.header.frame_id = self.map_frame
         start_pose.header.stamp = rospy.Time.now()
         goal.target.header.frame_id = self.map_frame
@@ -244,7 +243,7 @@ class SimpleEnv(gym.Env):
             else:
                 lasers[laser_length - i - 1] = self.laser_pool[prefix]
 
-        # global plan
+        # global plan, the plan is in robot frame
         plan = self._make_plan()
         if plan is None:
             rospy.logerr("could not get a global plan")
@@ -271,34 +270,23 @@ class SimpleEnv(gym.Env):
         }
 
     def _get_drl_vo_reward(self, action, observation):
-        info = {}
-        r_arrival = 20
-        r_waypoint = 3.2
-        r_collision = -20
-        r_scan = -0.2
-        r_rotation = -0.1
-
-        w_thresh = 0.7
-
-        reward = 0
         reward_func = RewardFunction()
+        linear = np.clip(action[0], min_vel_x, max_vel_x)
+        angular = np.clip(action[1], min_vel_z, max_vel_z)
 
-        linear, angular = action
-
-        # reach the goal reward
+        # arrival reward
+        digress_distance = np.linalg.norm(self.global_plan[0, :2])
         if self.training_state == TrainingState.REACHED:
             reward_arrival = r_arrival
         elif self.training_state == TrainingState.TRUNCATED:
             reward_arrival = -r_arrival
         else:
-            geodesic_distance = calculate_geodesic_distance(self.global_plan)
-            reward_arrival = r_waypoint * (self.last_geodesic_distance - geodesic_distance)
-            self.last_geodesic_distance = geodesic_distance
-        reward += reward_arrival
-        info["arrival"] = reward_arrival
-        reward_func.arrival_reward = reward_arrival
+            reward_arrival = r_waypoint * (digress_threshold / 2 - digress_distance)
+            # geodesic_distance = calculate_geodesic_distance(self.global_plan) + digress_distance
+            # reward_arrival = r_waypoint * (self.last_geodesic_distance - geodesic_distance)
+            # self.last_geodesic_distance = geodesic_distance
 
-        # obstacle reward
+        # collision reward
         reward_collision = 0
         if self.training_state == TrainingState.COLLISION:
             reward_collision = r_collision
@@ -306,20 +294,25 @@ class SimpleEnv(gym.Env):
             min_distance = np.min(self.laser_pool[-1])
             if min_distance < 3 * robot_radius:
                 reward_collision = r_scan * (3 * robot_radius - min_distance)
-        info["collision"] = reward_collision
-        reward += reward_collision
-        reward_func.collision_reward = reward_collision
 
-        # angular velocity punish
-        info["angular"] = 0
+        # angular reward
+        reward_angular = 0
         if abs(angular) >= w_thresh:
-            reward = abs(angular) * r_rotation
-            info["angular"] = abs(angular) * r_rotation
-            reward_func.angular_reward = abs(angular) * r_rotation
-        reward_func.total_reward = reward
+            reward_angular = abs(angular) * r_rotation
+
+        # direction reward
+        desire_angle = np.mean(self.global_plan[:look_ahead, 2])
+        reward_direction = (angle_threshold - abs(desire_angle)) * r_angle
+
+        reward_func.arrival_reward = reward_arrival
+        reward_func.collision_reward = reward_collision
+        reward_func.angular_reward = reward_angular
+        reward_func.direction_reward = reward_direction
+        reward_func.total_reward = reward_arrival + reward_collision + reward_angular + reward_direction
+        reward_info = dict(arrival=reward_arrival, collision=reward_collision,
+                           angular=reward_angular, direction=reward_direction, reward=reward_func.total_reward)
         self._reward_pub.publish(reward_func)
-        # theta reward
-        return reward, info
+        return reward_func.total_reward, reward_info
 
     def _is_done(self):
         # 1) Goal reached?
@@ -336,10 +329,16 @@ class SimpleEnv(gym.Env):
             rospy.logfatal("Carter reached the goal!")
             return self.training_state
 
-        # 2) Robot Trapped or out of bound?
-        if self._check_out_of_bound(curr_pose.pose.position.x, curr_pose.pose.position.y):
+        # 2) Robot Trapped or out of bound or get rolled?
+        if (abs(get_pitch(curr_pose.pose.orientation)) > math.pi / 3 or
+                abs(get_roll(curr_pose.pose.orientation)) > math.pi / 3):
             self.training_state = TrainingState.COLLISION
-            rospy.logfatal("Robot out of bound")
+            rospy.logfatal("Robot get rolled")
+            return self.training_state
+        if (self._check_out_of_bound(curr_pose.pose.position.x, curr_pose.pose.position.y) or
+                self._check_in_unknown_area(curr_pose.pose.position.x, curr_pose.pose.position.y)):
+            self.training_state = TrainingState.COLLISION
+            rospy.logfatal("Robot out of bound or in an known area")
             return self.training_state
         delta_distance = math.sqrt(math.pow(self.last_pose.pose.position.x - curr_pose.pose.position.x, 2) +
                                    math.pow(self.last_pose.pose.position.y - curr_pose.pose.position.y, 2))
@@ -357,9 +356,10 @@ class SimpleEnv(gym.Env):
 
         # 3) maximum number of iterations?
         self.num_iterations += 1
-        if self.num_iterations > max_iteration:
+        digress_distance = np.min(np.linalg.norm(self.global_plan[:, :2], axis=1))
+        if self.num_iterations > max_iteration or digress_distance >= digress_threshold:
             self.training_state = TrainingState.TRUNCATED
-            rospy.logfatal("Over the max iteration before going to the goal")
+            rospy.logfatal("Over the max iteration or digressing the global path a lot before going to the goal")
             return self.training_state
         return self.training_state
 
@@ -367,7 +367,7 @@ class SimpleEnv(gym.Env):
     def _map_callback(self, map_msg: OccupancyGrid):
         self.map = map_msg
 
-    def _make_pose(self):
+    def _make_robot_pose(self):
         pose = PoseStamped()
         robot_pose = self.robot.get_world_pose()
         pose.pose.position.x = robot_pose[0][0]
@@ -392,6 +392,12 @@ class SimpleEnv(gym.Env):
         origin_x = self.map.info.origin.position.x
         origin_y = self.map.info.origin.position.y
         return not (origin_x <= x <= bound_x and origin_y <= y <= bound_y)
+
+    def _check_in_unknown_area(self, x, y):
+        y_index = int((y - self.map.info.origin.position.y) / self.map.info.resolution)
+        x_index = int((x - self.map.info.origin.position.x) / self.map.info.resolution)
+        value = self.map.data[x_index + y_index * self.map.info.width]
+        return value != 0
 
     def _publish_tf(self):
         transform = TransformStamped()
@@ -481,8 +487,8 @@ def load_network_parameters(net_model):
 
 
 if __name__ == "__main__":
-    rospy.init_node('simple_rl_training', log_level=rospy.INFO)
-    env = Monitor(SimpleEnv(), save_log_dir)
+    rospy.init_node('drl_training', log_level=rospy.INFO)
+    env = Monitor(Environment(), save_log_dir)
     policy_kwargs = dict(
         features_extractor_class=TransformerFeatureExtractor,
         features_extractor_kwargs=dict(features_dim=512),

@@ -22,6 +22,16 @@ def get_yaw(quaternion: Quaternion):
     return yaw
 
 
+def get_pitch(quaternion: Quaternion):
+    _, pitch, _ = euler_from_quaternion([quaternion.x, quaternion.y, quaternion.z, quaternion.w])
+    return pitch
+
+
+def get_roll(quaternion: Quaternion):
+    roll, _, _ = euler_from_quaternion([quaternion.x, quaternion.y, quaternion.z, quaternion.w])
+    return roll
+
+
 def get_distance_from_path(path: Path):
     distance = 0.0
     for i in range(len(path.poses) - 1):
