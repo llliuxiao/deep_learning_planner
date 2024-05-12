@@ -6,8 +6,9 @@ from stable_baselines3 import PPO
 from sensor_msgs.msg import LaserScan
 from parameters import *
 from pose_utils import get_yaw, PoseUtils
+import os
 
-model_file = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs/best_model.zip"
+model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs/drl_policy_3/best_model.zip"
 
 
 class TransformerDRLInference:
@@ -47,8 +48,8 @@ class TransformerDRLInference:
             return
         cmd_vel = Twist()
         action, _states = self.model.predict(observation)
-        cmd_vel.linear.x = action[0] * (max_vel_x - min_vel_x) + min_vel_x
-        cmd_vel.angular.z = action[1] * (max_vel_z - min_vel_z) + min_vel_z
+        cmd_vel.linear.x = np.clip(action[0], min_vel_x, max_vel_x)
+        cmd_vel.angular.z = np.clip(action[1], min_vel_z, max_vel_z)
         self._cmd_vel_pub.publish(cmd_vel)
 
     def _get_observation(self):
@@ -80,7 +81,7 @@ class TransformerDRLInference:
         for i in range(laser_length - 1, 0, -1):
             prefix = len(self.laser_pool) - i * interval
             if prefix < 0:
-                continue
+                lasers[laser_length - i - 1] = self.laser_pool[0]
             else:
                 lasers[laser_length - i - 1] = self.laser_pool[prefix]
         lasers = np.array(lasers) / laser_range

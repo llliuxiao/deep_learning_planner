@@ -1,12 +1,12 @@
 # This is a transformer-based mobile robot motion planner to deploy trained model
 
+# utils
+import os
+import numpy as np
+
 # torch
 import torch
 from einops import repeat
-
-# utils
-import math
-import os
 
 # ros
 import rospy
@@ -15,33 +15,44 @@ import tf2_ros
 from geometry_msgs.msg import Twist, PoseStamped, Quaternion, TransformStamped
 from nav_msgs.msg import Path
 from sensor_msgs.msg import LaserScan
+from stable_baselines3.ppo import PPO
 from tf.transformations import euler_from_quaternion
 from tf2_ros import Buffer
 from tf2_ros.transform_listener import TransformListener
 
-from transformer_network import RobotTransformer
 from parameters import *
+from transformer_network import RobotTransformer
 
-model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model9/best.pth"
+imitation_model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model9/best.pth"
+reinforcement_model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs/drl_policy_3/best_model.zip"
 
 
 class TransformerPlanner:
     def __init__(self,
+                 flag: str,
+                 model_file: str,
                  velocity_factor=1.0,
                  robot_frame="base_footprint",
                  scan_topic_name="/map_scan",
                  global_topic_name="/robot4/move_base/GlobalPlanner/robot_frame_plan",
                  goal_topic_name="/robot4/move_base/current_goal",
                  cmd_topic_name="/vm_gsd601/gr_canopen_vm_motor/mobile_base_controller/cmd_vel"):
+        self.flag = flag
+        self.model_file = model_file
+
         self.robot_frame = robot_frame
         self.velocity_factor = velocity_factor
-
-        self.device = torch.device("cuda")
-        self.model = RobotTransformer()
-        self.model = torch.nn.DataParallel(self.model).to(self.device)
-        param = torch.load(model_file)["model_state_dict"]
-        self.model.load_state_dict(param)
-        self.model.train(False)
+        self.device = torch.device("cuda:0")
+        if self.flag == "imitation":
+            self.model = RobotTransformer()
+            self.model = torch.nn.DataParallel(self.model).to(self.device)
+            param = torch.load(model_file)["model_state_dict"]
+            self.model.load_state_dict(param)
+            self.model.train(False)
+        elif self.flag == "reinforcement":
+            self.model = PPO.load(model_file, device=self.device)
+        else:
+            rospy.logerr("The flag is neither imitation nor reinforcement")
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer)
@@ -147,14 +158,16 @@ class TransformerPlanner:
         global_plan_tensor = torch.div(global_plan, scale)
 
         # laser mask
-        laser_mask = torch.ones((laser_length, laser_length), dtype=torch.bool).triu(1)
-        laser_mask = torch.stack([laser_mask for _ in range(torch.cuda.device_count())]).to(self.device)
+        laser_mask = torch.ones((laser_length, laser_length), dtype=torch.bool).triu(1).to(self.device)
 
-        # unsqueeze
-        laser_tensor = torch.unsqueeze(laser_tensor, 0).to(self.device)
-        global_plan_tensor = torch.unsqueeze(global_plan_tensor, 0).to(self.device)
-        goal_tensor = torch.unsqueeze(goal_tensor, 0).to(self.device)
-        return laser_tensor, global_plan_tensor, goal_tensor, laser_mask
+        if self.flag == "imitation":
+            return laser_tensor, global_plan_tensor, goal_tensor, laser_mask
+        else:
+            # unsqueeze
+            laser_tensor = torch.unsqueeze(laser_tensor, 0).to(self.device)
+            global_plan_tensor = torch.unsqueeze(global_plan_tensor, 0).to(self.device)
+            goal_tensor = torch.unsqueeze(goal_tensor, 0).to(self.device)
+            return laser_tensor, global_plan_tensor, goal_tensor, laser_mask
 
     def wait_for_raw_data(self):
         while True:
@@ -162,6 +175,23 @@ class TransformerPlanner:
                 return
             else:
                 rospy.sleep(0.5)
+
+    def inference(self, laser: torch.Tensor, global_plan: torch.Tensor, goal: torch.Tensor, mask=None):
+        if self.flag == "imitation":
+            with torch.no_grad():
+                action = self.model(laser, global_plan, goal, mask)
+            action = torch.squeeze(action)
+            return self.velocity_factor * action[0].item(), self.velocity_factor * action[1].item()
+        elif self.flag == "reinforcement":
+            action, _states = self.model.predict({
+                "laser": laser.cpu().numpy(),
+                "global_plan": global_plan.cpu().numpy(),
+                "goal": goal.cpu().numpy()
+            })
+            action = np.squeeze(action)
+            return action[0], action[1]
+        else:
+            rospy.logerr("The flag is neither imitation nor reinforcement")
 
     def cmd_inference(self, event):
         if self.goal_reached or self.goal is None:
@@ -173,12 +203,9 @@ class TransformerPlanner:
             return
         else:
             laser_tensor, global_plan_tensor, goal_tensor, laser_mask = tensor
-        self.model.train(False)
-        with torch.no_grad():
-            predict = self.model(laser_tensor, global_plan_tensor, goal_tensor, laser_mask)
-        predict = torch.squeeze(predict)
-        cmd_vel.linear.x = self.velocity_factor * predict[0].item()
-        cmd_vel.angular.z = self.velocity_factor * predict[1].item()
+        action = self.inference(laser_tensor, global_plan_tensor, goal_tensor, laser_mask)
+        cmd_vel.linear.x = np.clip(action[0], min_vel_x, max_vel_x)
+        cmd_vel.angular.z = np.clip(action[1], min_vel_z, max_vel_z)
         distance = self.get_distance_to_goal()
         assert isinstance(self.global_plan, Path)
         if distance <= goal_radius and len(self.global_plan.poses) < 10:
@@ -207,6 +234,8 @@ class TransformerPlanner:
 if __name__ == "__main__":
     rospy.init_node("transformer_planner")
     planner = TransformerPlanner(
+        flag="reinforcement",
+        model_file=reinforcement_model_file,
         robot_frame="base_link",
         scan_topic_name="/scan",
         global_topic_name="/move_base/GlobalPlanner/robot_frame_plan",
