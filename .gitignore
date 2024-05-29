@@ -8,3 +8,4 @@ rl_logs
 scripts/__pycache__
 *.pyc
 *.pyi
+*.csv

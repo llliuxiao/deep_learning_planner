@@ -49,9 +49,9 @@ class TransformerPlanner006(TransformerPlanner):
             self.position_mode()
             rospy.logfatal("reach the goal")
         elif distance <= deceleration_tolerance and len(self.global_plan.poses) < 10:
-            linear = self.linear_deceleration(1.0 * self.velocity_factor,
-                                              deceleration_tolerance - distance,
-                                              deceleration_tolerance - goal_radius)
+            linear = self.linear_deceleration_stopping(1.0 * self.velocity_factor,
+                                                       deceleration_tolerance - distance,
+                                                       deceleration_tolerance - goal_radius)
             cmd_vel.angular.z = linear / cmd_vel.linear.x * cmd_vel.angular.z
             cmd_vel.linear.x = linear
             self.cmd_vel_pub.publish(cmd_vel)

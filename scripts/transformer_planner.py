@@ -1,17 +1,16 @@
-# This is a transformer-based mobile robot motion planner to deploy trained model
-
 # utils
+import argparse
 import os
 import numpy as np
-
-# torch
-import torch
-from einops import repeat
 
 # ros
 import rospy
 import tf2_geometry_msgs
 import tf2_ros
+
+# torch
+import torch
+from einops import repeat
 from geometry_msgs.msg import Twist, PoseStamped, Quaternion, TransformStamped
 from nav_msgs.msg import Path
 from sensor_msgs.msg import LaserScan
@@ -20,37 +19,31 @@ from tf.transformations import euler_from_quaternion
 from tf2_ros import Buffer
 from tf2_ros.transform_listener import TransformListener
 
+# customer module
 from parameters import *
+from pose_utils import distance_points2d
 from transformer_network import RobotTransformer
-
-imitation_model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model9/best.pth"
-reinforcement_model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs/drl_policy_3/best_model.zip"
 
 
 class TransformerPlanner:
-    def __init__(self,
-                 flag: str,
-                 model_file: str,
-                 velocity_factor=1.0,
-                 robot_frame="base_footprint",
-                 scan_topic_name="/map_scan",
-                 global_topic_name="/robot4/move_base/GlobalPlanner/robot_frame_plan",
-                 goal_topic_name="/robot4/move_base/current_goal",
-                 cmd_topic_name="/vm_gsd601/gr_canopen_vm_motor/mobile_base_controller/cmd_vel"):
-        self.flag = flag
-        self.model_file = model_file
+    def __init__(self, flag_: str, model_file_: str,
+                 robot_frame_, scan_topic_name_,
+                 global_topic_name_, goal_topic_name_,
+                 cmd_topic_name_, velocity_factor_=1.0):
+        self.flag = flag_
+        self.model_file = model_file_
 
-        self.robot_frame = robot_frame
-        self.velocity_factor = velocity_factor
+        self.robot_frame = robot_frame_
+        self.velocity_factor = velocity_factor_
         self.device = torch.device("cuda:0")
         if self.flag == "imitation":
             self.model = RobotTransformer()
             self.model = torch.nn.DataParallel(self.model).to(self.device)
-            param = torch.load(model_file)["model_state_dict"]
+            param = torch.load(model_file_)["model_state_dict"]
             self.model.load_state_dict(param)
             self.model.train(False)
         elif self.flag == "reinforcement":
-            self.model = PPO.load(model_file, device=self.device)
+            self.model = PPO.load(model_file_, device=self.device)
         else:
             rospy.logerr("The flag is neither imitation nor reinforcement")
 
@@ -64,11 +57,15 @@ class TransformerPlanner:
         # make laser pool as a queue
         self.laser_pool = []
         self.laser_pool_capacity = interval * laser_length
+        self.last_cmd_vel = (0.0, 0.0)
 
-        self.scan_sub = rospy.Subscriber(scan_topic_name, LaserScan, self.laser_callback, queue_size=1)
-        self.global_plan_sub = rospy.Subscriber(global_topic_name, Path, self.global_plan_callback, queue_size=1)
-        self.goal_sub = rospy.Subscriber(goal_topic_name, PoseStamped, self.goal_callback, queue_size=1)
-        self.cmd_vel_pub = rospy.Publisher(cmd_topic_name, Twist, queue_size=1)
+        self.scan_sub = rospy.Subscriber(scan_topic_name_, LaserScan, self.laser_callback, queue_size=1)
+        self.global_plan_sub = rospy.Subscriber(global_topic_name_, Path, self.global_plan_callback, queue_size=1)
+        self.goal_sub = rospy.Subscriber(goal_topic_name_, PoseStamped, self.goal_callback, queue_size=1)
+        self.cmd_vel_pub = rospy.Publisher(cmd_topic_name_, Twist, queue_size=1)
+
+        self.turning_distance = 0
+        self.looking_ahead_distance = 1.0
 
         # 50 HZ
         rospy.Timer(rospy.Duration(secs=0, nsecs=20000000), self.cmd_inference)
@@ -76,7 +73,9 @@ class TransformerPlanner:
     def laser_callback(self, msg: LaserScan):
         if len(self.laser_pool) > self.laser_pool_capacity:
             self.laser_pool.pop(0)
-        self.laser_pool.append(msg.ranges)
+        ranges = np.array(msg.ranges)
+        ranges = np.where(np.isinf(ranges), 10.0, ranges)
+        self.laser_pool.append(ranges)
 
     def goal_callback(self, msg: PoseStamped):
         if self.goal is None:
@@ -94,8 +93,13 @@ class TransformerPlanner:
         self.global_plan = msg
 
     @staticmethod
-    def linear_deceleration(v0, x, d) -> float:
+    def linear_deceleration_stopping(v0, x, d) -> float:
         return math.sqrt((d - x) / d) * v0
+
+    @staticmethod
+    def linear_deceleration_turning(v0, x, d, target) -> float:
+        # d mean total distance, x mean how much distance left
+        return math.sqrt(x / d * (v0 ** 2) + (d - x) / d * (target ** 2))
 
     def get_distance_to_goal(self) -> float:
         try:
@@ -118,7 +122,7 @@ class TransformerPlanner:
                 lasers[laser_length - i - 1] = self.laser_pool[0]
             else:
                 lasers[laser_length - i - 1] = self.laser_pool[prefix]
-        laser_tensor = torch.tensor(lasers, dtype=torch.float)
+        laser_tensor = torch.tensor(np.array(lasers), dtype=torch.float)
         laser_tensor = torch.div(laser_tensor, torch.tensor(laser_range, dtype=torch.float))
 
         # goal
@@ -158,15 +162,15 @@ class TransformerPlanner:
         global_plan_tensor = torch.div(global_plan, scale)
 
         # laser mask
-        laser_mask = torch.ones((laser_length, laser_length), dtype=torch.bool).triu(1).to(self.device)
+        laser_mask = torch.ones((1, laser_length, laser_length), dtype=torch.bool).triu(1).to(self.device)
 
         if self.flag == "imitation":
-            return laser_tensor, global_plan_tensor, goal_tensor, laser_mask
-        else:
-            # unsqueeze
             laser_tensor = torch.unsqueeze(laser_tensor, 0).to(self.device)
             global_plan_tensor = torch.unsqueeze(global_plan_tensor, 0).to(self.device)
             goal_tensor = torch.unsqueeze(goal_tensor, 0).to(self.device)
+            return laser_tensor, global_plan_tensor, goal_tensor, laser_mask
+        else:
+            # unsqueeze
             return laser_tensor, global_plan_tensor, goal_tensor, laser_mask
 
     def wait_for_raw_data(self):
@@ -193,6 +197,23 @@ class TransformerPlanner:
         else:
             rospy.logerr("The flag is neither imitation nor reinforcement")
 
+    def smooth(self, forward, angular):
+        cmd_vel = Twist()
+        cmd_vel.linear.x = 0.5 * forward + 0.5 * self.last_cmd_vel[0]
+        cmd_vel.angular.z = 0.5 * angular + 0.5 * self.last_cmd_vel[1]
+        rospy.loginfo_throttle(1, f"linear:{cmd_vel.linear.x}, angular:{cmd_vel.angular.z}")
+        return cmd_vel
+
+    def is_turing(self):
+        for pose in self.global_plan.poses:
+            delta_angle = self._get_yaw(pose.pose.orientation)
+            distance_turning = distance_points2d(self.global_plan.poses[0].pose.position, pose.pose.position)
+            if distance_turning > self.looking_ahead_distance:
+                return False
+            elif math.fabs(delta_angle) >= math.pi / 4:
+                self.turning_distance = distance_turning
+                return True
+
     def cmd_inference(self, event):
         if self.goal_reached or self.goal is None:
             return
@@ -204,26 +225,30 @@ class TransformerPlanner:
         else:
             laser_tensor, global_plan_tensor, goal_tensor, laser_mask = tensor
         action = self.inference(laser_tensor, global_plan_tensor, goal_tensor, laser_mask)
-        cmd_vel.linear.x = np.clip(action[0], min_vel_x, max_vel_x)
-        cmd_vel.angular.z = np.clip(action[1], min_vel_z, max_vel_z)
+        cmd_vel.linear.x, cmd_vel.angular.z = action[0], action[1]
         distance = self.get_distance_to_goal()
         assert isinstance(self.global_plan, Path)
-        if distance <= goal_radius and len(self.global_plan.poses) < 10:
+        if distance <= goal_radius and len(self.global_plan.poses) < 50:
             self.goal_reached = True
             self.goal = None
             self.cmd_vel_pub.publish(Twist())
             rospy.logfatal("reach the goal")
-        elif distance <= deceleration_tolerance and len(self.global_plan.poses) < 10:
-            linear = self.linear_deceleration(1.0 * self.velocity_factor,
-                                              deceleration_tolerance - distance,
-                                              deceleration_tolerance - goal_radius)
+        elif distance <= deceleration_tolerance and len(self.global_plan.poses) < 50:
+            linear = self.linear_deceleration_stopping(1.0 * self.velocity_factor,
+                                                       deceleration_tolerance - distance,
+                                                       deceleration_tolerance - goal_radius)
             cmd_vel.angular.z = linear / cmd_vel.linear.x * cmd_vel.angular.z
             cmd_vel.linear.x = linear
             self.cmd_vel_pub.publish(cmd_vel)
-            rospy.logfatal("close to the target")
-        else:
+        elif self.is_turing() and self.flag == "reinforcement":
+            linear = self.linear_deceleration_turning(1.0, self.turning_distance, self.looking_ahead_distance, 0.6)
+            cmd_vel.linear.x = linear
             self.cmd_vel_pub.publish(cmd_vel)
-            rospy.loginfo_throttle(1, f"linear:{cmd_vel.linear.x}, angular:{cmd_vel.angular.z}")
+        else:
+            cmd_vel = self.smooth(cmd_vel.linear.x, cmd_vel.angular.z)
+            self.cmd_vel_pub.publish(cmd_vel)
+        self.last_cmd_vel = (cmd_vel.linear.x, cmd_vel.angular.z)
+        rospy.loginfo(f"x: {cmd_vel.linear.x}, z: {cmd_vel.angular.z}")
 
     @staticmethod
     def _get_yaw(quaternion: Quaternion):
@@ -233,14 +258,35 @@ class TransformerPlanner:
 
 if __name__ == "__main__":
     rospy.init_node("transformer_planner")
+    parse = argparse.ArgumentParser(description="A ROS motion planner to deploy dnn model")
+    root_path = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner"
+    imitation_file = os.path.join(root_path, "transformer_logs/model9/best.pth")
+    reinforcement_file = os.path.join(root_path, "rl_logs/runs/drl_policy_24/best_model.zip")
+    parse.add_argument("-m", "--mode", type=str, default="imitation", help="imitation or reinforcement")
+    parse.add_argument("-r", "--robot", type=str, default="sim", help="sim or gr-agv234")
+    parse.add_argument("")
+    args = parse.parse_args()
+    flag = args.mode
+    model_file = imitation_file if flag == "imitation" else reinforcement_file
+    if args.robot == "sim":
+        robot_frame = "base_link"
+        scan_topic_name = "/scan"
+        global_topic_name = "/move_base/GlobalPlanner/robot_frame_plan",
+        goal_topic_name = "/move_base/current_goal",
+        cmd_topic_name = "/cmd_vel"
+    else:
+        robot_frame = "base_footprint",
+        scan_topic_name = "/map_scan",
+        global_topic_name = "/robot4/move_base/GlobalPlanner/robot_frame_plan",
+        goal_topic_name = "/robot4/move_base/current_goal",
+        cmd_topic_name = "/vm_gsd601/gr_canopen_vm_motor/mobile_base_controller/cmd_vel"
     planner = TransformerPlanner(
-        flag="reinforcement",
-        model_file=reinforcement_model_file,
-        robot_frame="base_link",
-        scan_topic_name="/scan",
-        global_topic_name="/move_base/GlobalPlanner/robot_frame_plan",
-        goal_topic_name="/move_base/current_goal",
-        cmd_topic_name="/cmd_vel"
+        flag_=flag,
+        model_file_=model_file,
+        robot_frame_=robot_frame,
+        scan_topic_name_=scan_topic_name,
+        global_topic_name_=global_topic_name,
+        goal_topic_name_=goal_topic_name,
+        cmd_topic_name_=cmd_topic_name
     )
-    # planner = TransformerPlanner()
     rospy.spin()
