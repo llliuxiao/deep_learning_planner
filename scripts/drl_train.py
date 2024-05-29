@@ -1,16 +1,11 @@
-import math
 import os
-
 from omni.isaac.kit import SimulationApp
 
 linux_user = os.getlogin()
-CARTER_USD_PATH = f"/home/{linux_user}/isaac_sim_ws/src/isaac_sim/isaac/carter.usd"
 config = {
     "headless": True
 }
 simulation_app = SimulationApp(config)
-
-# utils
 
 # isaac
 from omni.isaac.core import World
@@ -31,6 +26,7 @@ import angles
 import sys
 import torch
 import tqdm
+import argparse
 
 sys.path.append(f"/home/{os.getlogin()}/isaac_sim_ws/devel/lib/python3/dist-packages")
 
@@ -61,14 +57,7 @@ from stable_baselines3.ppo import PPO
 from parameters import *
 from pose_utils import PoseUtils, get_yaw, get_roll, get_pitch, calculate_geodesic_distance
 from transformer_drl_network import TransformerFeatureExtractor, CustomActorCriticPolicy
-from sb3_callbacks import SaveOnBestTrainingRewardCallback, RewardCallback
-
-save_log_dir = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs"
-pretrained_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model9/best.pth"
-if not os.path.exists(save_log_dir):
-    os.makedirs(save_log_dir)
-
-scene = "hospital"
+from sb3_callbacks import CustomCallback
 
 
 class TrainingState(enum.Enum):
@@ -79,7 +68,7 @@ class TrainingState(enum.Enum):
 
 
 class Environment(gym.Env):
-    def __init__(self):
+    def __init__(self, scene, total_timestep):
         # Random seeds
         self.seed()
 
@@ -90,6 +79,8 @@ class Environment(gym.Env):
         self.robot_frame = "base_link"
         self.map_frame = "map"
         self.laser_pool_capacity = interval * laser_length
+        self.total_timestep = total_timestep
+        self.scene = scene
 
         # reinforcement learning global variable
         self.num_envs = 1
@@ -109,7 +100,7 @@ class Environment(gym.Env):
         self.training_state = TrainingState.TRAINING
         self.num_iterations = 0
         self.target = PoseStamped()
-        self.pbar = tqdm.tqdm(total=max_iteration)
+        self.pbar = tqdm.tqdm(total=self.total_timestep)
         self.last_pose = None
         self.robot_trapped = 0
         self.last_geodesic_distance = 0
@@ -131,8 +122,7 @@ class Environment(gym.Env):
         self.pbar.update()
         if np.nan in action:
             rospy.logfatal(f"neural network calculated an unexpected value(nan)")
-        forward = np.clip(action[0], min_vel_x, max_vel_x)
-        angular = np.clip(action[1], min_vel_z, max_vel_z)
+        forward, angular = action[0], action[1]
         cmd_vel = Twist()
         cmd_vel.linear.x = forward
         cmd_vel.angular.z = angular
@@ -183,7 +173,6 @@ class Environment(gym.Env):
         self.training_state = TrainingState.TRAINING
         self.num_iterations = 0
         self.robot_trapped = 0
-        self.pbar.reset()
         return observations, {}
 
     def close(self):
@@ -270,8 +259,7 @@ class Environment(gym.Env):
 
     def _get_drl_vo_reward(self, action, observation):
         reward_func = RewardFunction()
-        linear = np.clip(action[0], min_vel_x, max_vel_x)
-        angular = np.clip(action[1], min_vel_z, max_vel_z)
+        linear, angular = action[0], action[1]
 
         # arrival reward
         digress_distance = np.linalg.norm(self.global_plan[0, :2])
@@ -434,7 +422,7 @@ class Environment(gym.Env):
                 create_robot=True,
                 usd_path=asset_path,
                 position=np.array([1.5, 1.5, 0.3]),
-                orientation=np.array([np.cos(1.0), 0.0, 0.0, 0.0])
+                orientation=np.array([1.0, 0.0, 0.0, 0.0])
             )
         )
         self.lidar_path = "/World/Carters/Carter_0/chassis_link/lidar"
@@ -450,7 +438,7 @@ class Environment(gym.Env):
         )
         self.lidarInterface = _range_sensor.acquire_lidar_sensor_interface()
         self.controller = DifferentialController(name="simple_control", wheel_radius=0.24, wheel_base=0.56)
-        env_usd_path = f"/home/{linux_user}/isaac_sim_ws/src/isaac_sim/isaac/hospital.usd"
+        env_usd_path = f"/home/{linux_user}/isaac_sim_ws/src/isaac_sim/isaac/{self.scene}.usd"
         add_reference_to_stage(usd_path=env_usd_path, prim_path="/World/Envs/Env_0")
         self.world.scene.add(
             GeometryPrim(
@@ -464,8 +452,8 @@ class Environment(gym.Env):
         self.world.reset()
 
 
-def load_network_parameters(net_model):
-    param = torch.load(pretrained_model)["model_state_dict"]
+def load_network_parameters(net_model, model_file):
+    param = torch.load(model_file)["model_state_dict"]
     feature_extractor_param = {}
     mlp_extractor_param = {}
     action_net_param = {}
@@ -482,35 +470,45 @@ def load_network_parameters(net_model):
     net_model.features_extractor.load_state_dict(feature_extractor_param)
     net_model.mlp_extractor.mlp_extractor_actor.load_state_dict(mlp_extractor_param)
     net_model.action_net.load_state_dict(action_net_param)
+    net_model.features_extractor.requires_grad_(False)
 
 
 if __name__ == "__main__":
     rospy.init_node('drl_training', log_level=rospy.INFO)
-    env = Monitor(Environment(), save_log_dir)
+    parser = argparse.ArgumentParser(description="this is a script to train the drl based motion planner")
+    save_log_dir = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs"
+    pretrained_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model9/best.pth"
+    parser.add_argument("--scene", default="small_warehouse", type=str, help="name of training scene")
+    parser.add_argument("--step", default=500_000, type=int, help="total time steps for drl training")
+    parser.add_argument("--save_logdir", default=save_log_dir, type=str, help="directory to save log")
+    parser.add_argument("--model_file", default=pretrained_model, type=str, help="path of model file")
+    args = parser.parse_args()
+    if not os.path.exists(args.save_logdir):
+        os.makedirs(args.save_logdir)
+
+    env = Monitor(Environment(args.scene, args.step), args.save_logdir)
     policy_kwargs = dict(
         features_extractor_class=TransformerFeatureExtractor,
         features_extractor_kwargs=dict(features_dim=512),
         net_arch=dict(pi=[256], qf=[128]),
-        optimizer_kwargs=dict(weight_decay=0.00001),
-        log_std_init=-2,
+        # optimizer_kwargs=dict(weight_decay=0.00001),
     )
-    model = PPO(CustomActorCriticPolicy,  # ?
+    model = PPO(CustomActorCriticPolicy,
                 env=env,
-                verbose=2,  # similar to log level
-                learning_rate=5e-6,
-                batch_size=256,
-                tensorboard_log=save_log_dir,
+                verbose=2,
+                learning_rate=1e-5,
+                batch_size=512,
+                tensorboard_log=args.save_logdir,
                 n_epochs=10,
-                n_steps=512,
+                n_steps=1024,
                 gamma=0.99,
                 policy_kwargs=policy_kwargs,
                 device=torch.device("cuda:1"))
-    load_network_parameters(model.policy)
-    save_model_callback = SaveOnBestTrainingRewardCallback(check_freq=1024, log_dir=save_log_dir, verbose=2)
-    reward_callback = RewardCallback(verbose=2)
-    callback_list = CallbackList([save_model_callback, reward_callback])
-    model.learn(total_timesteps=1000_000,
-                log_interval=5,  # episodes interval of log
+    load_network_parameters(model.policy, args.model_file)
+    save_reward_callback = CustomCallback(check_freq=1024, log_dir=args.save_logdir)
+    callback_list = CallbackList([save_reward_callback])
+    model.learn(total_timesteps=args.step,
+                log_interval=1,
                 tb_log_name='drl_policy',
                 reset_num_timesteps=True,
                 callback=callback_list)
