@@ -80,7 +80,7 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim)
         self.latent_dim_pi = 256
         self.latent_dim_vf = 128
-        self.laser_mask = torch.triu(torch.ones((laser_length, laser_length), dtype=torch.bool), 1).to("cuda:1")
+        self.laser_mask = torch.triu(torch.ones((laser_length, laser_length), dtype=torch.bool), 1).to("cuda")
         # laser
         self.laser_pre = nn.Linear(1080, 512)
         self.laser_position_encoding = PositionalEncoding(d_model=512, max_seq_len=6)

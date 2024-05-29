@@ -6,7 +6,6 @@ from tf2_ros import TransformException
 from geometry_msgs.msg import PoseStamped, Quaternion
 from nav_msgs.msg import OccupancyGrid, Path
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
-# import tf2_geometry_msgs
 
 # utils
 import random
@@ -52,6 +51,12 @@ def calculate_geodesic_distance(path):
     return distance
 
 
+def distance_points2d(point1, point2):
+    delta_x = point2.x - point1.x
+    delta_y = point2.y - point1.y
+    return math.sqrt(delta_x ** 2 + delta_y ** 2)
+
+
 class PoseUtils:
     def __init__(self, robot_radius, scene=None):
         self.buffer = Buffer()
@@ -78,19 +83,20 @@ class PoseUtils:
             rospy.logfatal(f"Could not look transform from {source_frame} to {target_frame}")
             return None
 
-    # def transform_pose(self, target_pose: PoseStamped, target_frame):
-    #     try:
-    #         pose = tf2_geometry_msgs.PoseStamped()
-    #         pose.header = target_pose.header
-    #         pose.header.stamp = rospy.Time.now()
-    #         pose.pose = target_pose.pose
-    #         transformed_pose = self.buffer.transform(pose, target_frame, timeout=rospy.Duration(secs=1))
-    #         assert isinstance(transformed_pose, PoseStamped)
-    #         return transformed_pose
-    #     except TransformException as ex:
-    #         rospy.logfatal(ex)
-    #         rospy.logfatal(f"Could not look transform from {target_pose.header.frame_id} to {target_frame}")
-    #         return None
+    def transform_pose(self, target_pose: PoseStamped, target_frame):
+        import tf2_geometry_msgs
+        try:
+            pose = tf2_geometry_msgs.PoseStamped()
+            pose.header = target_pose.header
+            pose.header.stamp = rospy.Time.now()
+            pose.pose = target_pose.pose
+            transformed_pose = self.buffer.transform(pose, target_frame, timeout=rospy.Duration(secs=1))
+            assert isinstance(transformed_pose, PoseStamped)
+            return transformed_pose
+        except TransformException as ex:
+            rospy.logfatal(ex)
+            rospy.logfatal(f"Could not look transform from {target_pose.header.frame_id} to {target_frame}")
+            return None
 
     def get_random_pose(self, static_map: OccupancyGrid, source_frame, target_frame):
         map_width = static_map.info.width * static_map.info.resolution + static_map.info.origin.position.x

@@ -1,4 +1,8 @@
-import json
+import sys
+import os
+
+sys.path.append(f"/home/{os.getlogin()}/isaac_sim_ws/devel/lib/python3/dist-packages")
+
 import math
 import threading
 import actionlib
