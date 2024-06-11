@@ -26,15 +26,13 @@ from transformer_network import RobotTransformer
 
 
 class TransformerPlanner:
-    def __init__(self, flag_: str, model_file_: str,
-                 robot_frame_, scan_topic_name_,
-                 global_topic_name_, goal_topic_name_,
-                 cmd_topic_name_, velocity_factor_=1.0):
+    def __init__(self, flag_, model_file_, robot_frame, scan_topic_name,
+                 global_topic_name, goal_topic_name, cmd_topic_name, velocity_factor=1.0):
         self.flag = flag_
         self.model_file = model_file_
 
-        self.robot_frame = robot_frame_
-        self.velocity_factor = velocity_factor_
+        self.robot_frame = robot_frame
+        self.velocity_factor = velocity_factor
         self.device = torch.device("cuda:0")
         if self.flag == "imitation":
             self.model = RobotTransformer()
@@ -59,10 +57,10 @@ class TransformerPlanner:
         self.laser_pool_capacity = interval * laser_length
         self.last_cmd_vel = (0.0, 0.0)
 
-        self.scan_sub = rospy.Subscriber(scan_topic_name_, LaserScan, self.laser_callback, queue_size=1)
-        self.global_plan_sub = rospy.Subscriber(global_topic_name_, Path, self.global_plan_callback, queue_size=1)
-        self.goal_sub = rospy.Subscriber(goal_topic_name_, PoseStamped, self.goal_callback, queue_size=1)
-        self.cmd_vel_pub = rospy.Publisher(cmd_topic_name_, Twist, queue_size=1)
+        self.scan_sub = rospy.Subscriber(scan_topic_name, LaserScan, self.laser_callback, queue_size=1)
+        self.global_plan_sub = rospy.Subscriber(global_topic_name, Path, self.global_plan_callback, queue_size=1)
+        self.goal_sub = rospy.Subscriber(goal_topic_name, PoseStamped, self.goal_callback, queue_size=1)
+        self.cmd_vel_pub = rospy.Publisher(cmd_topic_name, Twist, queue_size=1)
 
         self.turning_distance = 0
         self.looking_ahead_distance = 1.0
@@ -269,24 +267,24 @@ if __name__ == "__main__":
     flag = args.mode
     model_file = imitation_file if flag == "imitation" else reinforcement_file
     if args.robot == "sim":
-        robot_frame = "base_link"
-        scan_topic_name = "/scan"
-        global_topic_name = "/move_base/GlobalPlanner/robot_frame_plan",
-        goal_topic_name = "/move_base/current_goal",
-        cmd_topic_name = "/cmd_vel"
+        planner_kwargs = dict(
+            flag=flag,
+            model_file=model_file,
+            robot_frame="base_link",
+            scan_topic_name="/scan",
+            global_topic_name="/move_base/GlobalPlanner/robot_frame_plan",
+            goal_topic_name="/move_base/current_goal",
+            cmd_topic_name="/cmd_vel",
+        )
     else:
-        robot_frame = "base_footprint",
-        scan_topic_name = "/map_scan",
-        global_topic_name = "/robot4/move_base/GlobalPlanner/robot_frame_plan",
-        goal_topic_name = "/robot4/move_base/current_goal",
-        cmd_topic_name = "/vm_gsd601/gr_canopen_vm_motor/mobile_base_controller/cmd_vel"
-    planner = TransformerPlanner(
-        flag_=flag,
-        model_file_=model_file,
-        robot_frame_=robot_frame,
-        scan_topic_name_=scan_topic_name,
-        global_topic_name_=global_topic_name,
-        goal_topic_name_=goal_topic_name,
-        cmd_topic_name_=cmd_topic_name
-    )
+        planner_kwargs = dict(
+            flag=flag,
+            model_file=model_file,
+            robot_frame="base_footprint",
+            scan_topic_name="/map_scan",
+            global_topic_name="/robot4/move_base/GlobalPlanner/robot_frame_plan",
+            goal_topic_name="/robot4/move_base/current_goal",
+            cmd_topic_name="/vm_gsd601/gr_canopen_vm_motor/mobile_base_controller/cmd_vel"
+        )
+    planner = TransformerPlanner(**planner_kwargs)
     rospy.spin()

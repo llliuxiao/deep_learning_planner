@@ -72,15 +72,15 @@ class Environment(gym.Env):
         # Random seeds
         self.seed()
 
-        # isaac
-        self._setup_scene()
-
         # const
         self.robot_frame = "base_link"
         self.map_frame = "map"
         self.laser_pool_capacity = interval * laser_length
         self.total_timestep = total_timestep
         self.scene = scene
+
+        # isaac
+        self._setup_scene()
 
         # reinforcement learning global variable
         self.num_envs = 1
