@@ -10,7 +10,7 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from torch import nn
 
 from transformer_network import Transformer, PositionalEncoding
-from parameters import *
+from utils.parameters import *
 
 
 class CustomMlpExtractor(nn.Module):

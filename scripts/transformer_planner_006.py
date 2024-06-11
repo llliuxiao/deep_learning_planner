@@ -1,6 +1,6 @@
 from transformer_planner import TransformerPlanner
-from parameters import *
-
+from utils.parameters import *
+import os
 import rospy
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Path
@@ -12,15 +12,22 @@ import actionlib
 
 class TransformerPlanner006(TransformerPlanner):
     def __init__(self,
-                 velocity_factor=0.6,
+                 flag="imitation",
                  robot_frame="base_footprint",
                  scan_topic_name="/map_scan",
                  global_topic_name="/robot6/move_base/GlobalPlanner/robot_frame_plan",
                  goal_topic_name="/robot6/move_base/current_goal",
                  cmd_topic_name="/vm_gsd601/gr_canopen_vm_motor/mobile_base_controller/cmd_vel",
                  short_distance_movement_action="/robot6/short_distance_movement"):
-        super().__init__(velocity_factor, robot_frame, scan_topic_name,
-                         global_topic_name, goal_topic_name, cmd_topic_name)
+        root_path = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner"
+        imitation_file = os.path.join(root_path, "transformer_logs/model9/best.pth")
+        super().__init__(flag_=flag,
+                         model_file_=imitation_file,
+                         robot_frame=robot_frame,
+                         scan_topic_name=scan_topic_name,
+                         global_topic_name=global_topic_name,
+                         goal_topic_name=goal_topic_name,
+                         cmd_topic_name=cmd_topic_name)
         self.client = actionlib.SimpleActionClient(short_distance_movement_action, MoveBaseAction)
         self.client.wait_for_server(rospy.Duration(secs=10))
 

@@ -4,8 +4,8 @@ from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Path
 from stable_baselines3 import PPO
 from sensor_msgs.msg import LaserScan
-from parameters import *
-from pose_utils import get_yaw, PoseUtils
+from utils.parameters import *
+from utils.pose_utils import get_yaw, PoseUtils
 import os
 
 model_file = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs/drl_policy_3/best_model.zip"

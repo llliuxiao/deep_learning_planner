@@ -54,10 +54,10 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.ppo import PPO
 
 # customer code
-from parameters import *
-from pose_utils import PoseUtils, get_yaw, get_roll, get_pitch, calculate_geodesic_distance
+from utils.parameters import *
+from utils.pose_utils import PoseUtils, get_yaw, get_roll, get_pitch, calculate_geodesic_distance
 from transformer_drl_network import TransformerFeatureExtractor, CustomActorCriticPolicy
-from sb3_callbacks import CustomCallback
+from utils.sb3_callbacks import CustomCallback
 
 
 class TrainingState(enum.Enum):

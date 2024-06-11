@@ -52,6 +52,9 @@ class CustomPPO(PPO):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.imitation_policy = ImitationPolicy(self.observation_space, self.action_space, self.lr_schedule)
+        self.target_kl_loss = torch.zeros(1).requires_grad(False)
+        self.log_temperature = th.log(th.ones(1)).requires_grad(True)
+        self.temperature_optimizer = th.optim.Adam(params=[self.log_temperature], lr=self.lr_schedule(1))
 
     def load_state_dict(self, model_file: str):
         param = th.load(model_file)["model_state_dict"]
@@ -114,7 +117,14 @@ class CustomPPO(PPO):
                 define kl loss
                 """
                 kl_loss = self.imitation_policy.calculate_kl_loss(rollout_data.observations, actions, log_prob)
+                temperature = torch.exp(self.log_temperature.detach())
+                kl_loss = temperature * kl_loss
                 kl_losses.append(kl_loss)
+
+                self.temperature_optimizer.zero_grad()
+                kl_loss.backward()
+                self.temperature_optimizer.step()
+
                 values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
@@ -157,7 +167,7 @@ class CustomPPO(PPO):
 
                 entropy_losses.append(entropy_loss.item())
 
-                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + kl_loss
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + self.log_temperature * kl_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417

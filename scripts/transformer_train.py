@@ -1,18 +1,17 @@
+# utils
+import os
+
 # torch
 import torch
 import torch.nn as nn
-
-# utils
-import math
-import os
+from torch.utils.tensorboard import SummaryWriter
 
 # visualization
 from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
 
-from data import load_data
+from data.data import load_data
 from transformer_network import RobotTransformer
-from parameters import *
+from utils.parameters import *
 
 linux_user = os.getlogin()
 save_root = f"/home/{linux_user}/isaac_sim_ws/src/deep_learning_planner/transformer_logs"
@@ -31,7 +30,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 
 class VelocityCmdLoss(nn.Module):
-    def __init__(self, device=torch.device("cuda")):
+    def __init__(self):
         super().__init__()
 
     def forward(self, inputs, targets):
