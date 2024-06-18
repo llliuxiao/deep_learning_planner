@@ -23,7 +23,7 @@ goal_radius = 0.5
 deceleration_tolerance = 1.0
 
 # reinforcement learning train
-max_iteration = 512
+max_iteration = 1024
 
 r_arrival = 50
 r_waypoint = 3.2

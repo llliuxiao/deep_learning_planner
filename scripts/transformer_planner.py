@@ -259,17 +259,16 @@ if __name__ == "__main__":
     parse = argparse.ArgumentParser(description="A ROS motion planner to deploy dnn model")
     root_path = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner"
     imitation_file = os.path.join(root_path, "transformer_logs/model9/best.pth")
-    reinforcement_file = os.path.join(root_path, "rl_logs/runs/drl_policy_24/best_model.zip")
+    reinforcement_file = os.path.join(root_path, "rl_logs/runs/drl_policy_31/best_model.zip")
     parse.add_argument("-m", "--mode", type=str, default="imitation", help="imitation or reinforcement")
     parse.add_argument("-r", "--robot", type=str, default="sim", help="sim or gr-agv234")
-    parse.add_argument("")
     args = parse.parse_args()
     flag = args.mode
     model_file = imitation_file if flag == "imitation" else reinforcement_file
     if args.robot == "sim":
         planner_kwargs = dict(
-            flag=flag,
-            model_file=model_file,
+            flag_=flag,
+            model_file_=model_file,
             robot_frame="base_link",
             scan_topic_name="/scan",
             global_topic_name="/move_base/GlobalPlanner/robot_frame_plan",
@@ -278,8 +277,8 @@ if __name__ == "__main__":
         )
     else:
         planner_kwargs = dict(
-            flag=flag,
-            model_file=model_file,
+            flag_=flag,
+            model_file_=model_file,
             robot_frame="base_footprint",
             scan_topic_name="/map_scan",
             global_topic_name="/robot4/move_base/GlobalPlanner/robot_frame_plan",

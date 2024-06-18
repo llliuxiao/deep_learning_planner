@@ -19,7 +19,6 @@ from omni.isaac.core.utils.nucleus import get_assets_root_path
 
 # utils
 import enum
-import os
 import re
 import time
 import angles
@@ -133,7 +132,7 @@ class Environment(gym.Env):
         self._publish_tf()
         state = self._is_done()
         observations = self._get_observation()
-        reward, info = self._get_drl_vo_reward(action, observations)
+        reward, info = self._get_reward(action, observations)
         return (observations, reward, state == TrainingState.REACHED,
                 state == TrainingState.COLLISION or state == TrainingState.TRUNCATED, info)
 
@@ -257,10 +256,11 @@ class Environment(gym.Env):
             "goal": goal
         }
 
-    def _get_drl_vo_reward(self, action, observation):
+    def _get_reward(self, action, observation):
         reward_func = RewardFunction()
         linear, angular = action[0], action[1]
 
+        ##################################################################
         # arrival reward
         digress_distance = np.linalg.norm(self.global_plan[0, :2])
         if self.training_state == TrainingState.REACHED:
@@ -268,36 +268,39 @@ class Environment(gym.Env):
         elif self.training_state == TrainingState.TRUNCATED:
             reward_arrival = -r_arrival
         else:
-            reward_arrival = r_waypoint * (digress_threshold / 2 - digress_distance)
-            # geodesic_distance = calculate_geodesic_distance(self.global_plan) + digress_distance
-            # reward_arrival = r_waypoint * (self.last_geodesic_distance - geodesic_distance)
-            # self.last_geodesic_distance = geodesic_distance
-
+            # reward_arrival = r_waypoint * (digress_threshold / 2 - digress_distance)
+            geodesic_distance = calculate_geodesic_distance(self.global_plan)
+            reward_arrival = r_waypoint * (self.last_geodesic_distance - geodesic_distance)
+            self.last_geodesic_distance = geodesic_distance
+        ##################################################################
         # collision reward
         reward_collision = 0
         if self.training_state == TrainingState.COLLISION:
             reward_collision = r_collision
         else:
             min_distance = np.min(self.laser_pool[-1])
-            if min_distance < 3 * robot_radius:
-                reward_collision = r_scan * (3 * robot_radius - min_distance)
-
+            if min_distance < 2 * robot_radius:
+                reward_collision = r_scan * (2 * robot_radius - min_distance)
+        ##################################################################
         # angular reward
+        # reward_angular = 0
+        # if abs(angular) >= w_thresh:
+        #     reward_angular = abs(angular) * r_rotation
         reward_angular = 0
-        if abs(angular) >= w_thresh:
-            reward_angular = abs(angular) * r_rotation
-
+        ##################################################################
         # direction reward
-        desire_angle = np.mean(self.global_plan[:look_ahead, 2])
-        reward_direction = (angle_threshold - abs(desire_angle)) * r_angle
-
+        # desire_angle = np.mean(self.global_plan[:look_ahead, 2])
+        # reward_direction = (angle_threshold - abs(desire_angle)) * r_angle
+        reward_direction = 0
+        ##################################################################
         reward_func.arrival_reward = reward_arrival
         reward_func.collision_reward = reward_collision
         reward_func.angular_reward = reward_angular
         reward_func.direction_reward = reward_direction
         reward_func.total_reward = reward_arrival + reward_collision + reward_angular + reward_direction
         reward_info = dict(arrival=reward_arrival, collision=reward_collision,
-                           angular=reward_angular, direction=reward_direction, reward=reward_func.total_reward)
+                           angular=reward_angular, direction=reward_direction,
+                           reward=reward_func.total_reward, is_success=(self.training_state == TrainingState.REACHED))
         self._reward_pub.publish(reward_func)
         return reward_func.total_reward, reward_info
 
@@ -413,7 +416,9 @@ class Environment(gym.Env):
         self.world = World(stage_units_in_meters=1.0, physics_dt=0.05, rendering_dt=0.05)
         assets_root_path = get_assets_root_path()
         asset_path = assets_root_path + "/Isaac/Robots/Carter/carter_v1.usd"
+        # asset_path = assets_root_path + "/Isaac/Robots/Carter/nova_carter.usd"
         wheel_dof_names = ["left_wheel", "right_wheel"]
+        # wheel_dof_names = ["joint_wheel_left", "joint_wheel_right"]
         self.robot = self.world.scene.add(
             WheeledRobot(
                 prim_path="/World/Carters/Carter_0",
@@ -438,6 +443,7 @@ class Environment(gym.Env):
         )
         self.lidarInterface = _range_sensor.acquire_lidar_sensor_interface()
         self.controller = DifferentialController(name="simple_control", wheel_radius=0.24, wheel_base=0.56)
+        # self.controller = DifferentialController(name="simple_control", wheel_radius=0.14, wheel_base=0.4132)
         env_usd_path = f"/home/{linux_user}/isaac_sim_ws/src/isaac_sim/isaac/{self.scene}.usd"
         add_reference_to_stage(usd_path=env_usd_path, prim_path="/World/Envs/Env_0")
         self.world.scene.add(
@@ -452,7 +458,7 @@ class Environment(gym.Env):
         self.world.reset()
 
 
-def load_network_parameters(net_model, model_file):
+def load_network_parameters(net_model, model_file, mode):
     param = torch.load(model_file)["model_state_dict"]
     feature_extractor_param = {}
     mlp_extractor_param = {}
@@ -471,17 +477,21 @@ def load_network_parameters(net_model, model_file):
     net_model.mlp_extractor.mlp_extractor_actor.load_state_dict(mlp_extractor_param)
     net_model.action_net.load_state_dict(action_net_param)
     net_model.features_extractor.requires_grad_(False)
+    if mode is True:
+        net_model.mlp_extractor.requires_grad_(False)
+        net_model.action_net.requires_grad_(False)
 
 
 if __name__ == "__main__":
     rospy.init_node('drl_training', log_level=rospy.INFO)
     parser = argparse.ArgumentParser(description="this is a script to train the drl based motion planner")
     save_log_dir = f"/home/{os.getlogin()}/isaac_sim_ws/src/deep_learning_planner/rl_logs/runs"
-    pretrained_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model9/best.pth"
+    pretrained_model = "/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model10/best.pth"
     parser.add_argument("--scene", default="small_warehouse", type=str, help="name of training scene")
     parser.add_argument("--step", default=500_000, type=int, help="total time steps for drl training")
     parser.add_argument("--save_logdir", default=save_log_dir, type=str, help="directory to save log")
     parser.add_argument("--model_file", default=pretrained_model, type=str, help="path of model file")
+    parser.add_argument("--deterministic", default=False, type=bool, help="training or calculate baseline reward")
     args = parser.parse_args()
     if not os.path.exists(args.save_logdir):
         os.makedirs(args.save_logdir)
@@ -493,6 +503,7 @@ if __name__ == "__main__":
         net_arch=dict(pi=[256], qf=[128]),
         # optimizer_kwargs=dict(weight_decay=0.00001),
     )
+    CustomActorCriticPolicy.deterministic = args.deterministic
     model = PPO(CustomActorCriticPolicy,
                 env=env,
                 verbose=2,
@@ -504,7 +515,7 @@ if __name__ == "__main__":
                 gamma=0.99,
                 policy_kwargs=policy_kwargs,
                 device=torch.device("cuda:1"))
-    load_network_parameters(model.policy, args.model_file)
+    load_network_parameters(model.policy, args.model_file, args.deterministic)
     save_reward_callback = CustomCallback(check_freq=1024, log_dir=args.save_logdir)
     callback_list = CallbackList([save_reward_callback])
     model.learn(total_timesteps=args.step,

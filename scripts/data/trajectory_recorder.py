@@ -14,11 +14,14 @@ import enum
 import json
 import numpy as np
 from tqdm import tqdm
+
+sys.path.append(f"/home/{os.getlogin()}/isaac_sim_ws/devel/lib/python3/dist-packages")
+
 # ROS
 import rospy
 import tf2_geometry_msgs
 from actionlib import SimpleActionClient
-from geometry_msgs.msg import Pose, TwistStamped
+from geometry_msgs.msg import Pose, TwistStamped, TransformStamped
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion
 from isaac_sim.msg import ResetPosesGoal, ResetPosesAction
 from move_base_msgs.msg import MoveBaseGoal, MoveBaseResult, MoveBaseAction
@@ -36,7 +39,7 @@ robot_radius = 0.5
 # global const
 max_step = 500000
 linux_user = os.getlogin()
-dataset_root_path = f"/home/{linux_user}/Downloads/pretraining_dataset/test"
+dataset_root_path = f"/home/{linux_user}/Downloads/pretraining_dataset_local_path/hospital"
 if not os.path.exists(dataset_root_path):
     os.mkdir(dataset_root_path)
 
@@ -139,6 +142,7 @@ class TrajectoryRecorder:
             point.pose = self.target_pose
             point.header.frame_id = "map"
             target_pose = self.tf_buffer.transform(point, "base_link")
+            robot_pose = self.tf_buffer.lookup_transform("base_link", "map", rospy.Time(0))
             assert isinstance(target_pose, PoseStamped)
         except TransformException:
             rospy.logfatal("could not transform target to robot base_link")
@@ -154,11 +158,16 @@ class TrajectoryRecorder:
         local_plan_path = os.path.join(
             f"{dataset_root_path}/trajectory{self.trajectory_num}",
             f"local_plan{self.step_num}.npy")
+        assert isinstance(robot_pose, TransformStamped)
+
         data = {
             "time": rospy.Time.now().to_sec(),
             "target_x": target_pose.pose.position.x,
             "target_y": target_pose.pose.position.y,
             "target_yaw": self._get_yaw(target_pose.pose.orientation),
+            "robot_x": robot_pose.transform.translation.x,
+            "robot_y": robot_pose.transform.translation.y,
+            "robot_yaw": self._get_yaw(robot_pose.transform.rotation),
             "cmd_vel_linear": cmd_vel_msg.twist.linear.x,
             "cmd_vel_angular": cmd_vel_msg.twist.angular.z,
             "laser_path": laser_path,

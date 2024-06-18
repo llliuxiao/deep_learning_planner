@@ -35,6 +35,8 @@ class CustomMlpExtractor(nn.Module):
 
 
 class CustomActorCriticPolicy(ActorCriticPolicy):
+    deterministic = False
+
     def __init__(
             self,
             observation_space: spaces.Space,
@@ -69,7 +71,7 @@ class CustomActorCriticPolicy(ActorCriticPolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
-        actions = distribution.get_actions(deterministic=deterministic)
+        actions = distribution.get_actions(deterministic=self.deterministic)
         log_prob = distribution.log_prob(actions)
         actions = actions.reshape((-1, *self.action_space.shape))
         return actions, values, log_prob
