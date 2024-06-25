@@ -12,6 +12,7 @@ import random
 import math
 import json
 import sys
+import angles
 
 sys.path.append("/usr/lib/python3/dist-packages")
 
@@ -52,9 +53,36 @@ def calculate_geodesic_distance(path):
 
 
 def distance_points2d(point1, point2):
+    assert hasattr(point1, "x") and hasattr(point1, "y")
+    assert hasattr(point2, "x") and hasattr(point2, "y")
     delta_x = point2.x - point1.x
     delta_y = point2.y - point1.y
     return math.sqrt(delta_x ** 2 + delta_y ** 2)
+
+
+def calculate_robot_position(target: tuple, relevance: tuple):
+    target_x, target_y, target_yaw = target
+    relevance_x, relevance_y, relevance_yaw = relevance
+    robot_yaw = angles.normalize_angle(target_yaw - relevance_yaw)
+    sin_yaw, cos_yaw = -math.sin(robot_yaw), math.cos(robot_yaw)
+    dx = cos_yaw * relevance_x + sin_yaw * relevance_y
+    dy = -sin_yaw * relevance_x + cos_yaw * relevance_y
+    robot_x = target_x - dx
+    robot_y = target_y - dy
+    return robot_x, robot_y, robot_yaw
+
+
+def calculate_relevant_position(robot_pose, target_pose):
+    robot_x, robot_y, robot_yaw = robot_pose
+    target_x, target_y, target_yaw = target_pose
+    dx = target_x - robot_x
+    dy = target_y - robot_y
+    sin_yaw = -math.sin(robot_yaw)
+    cos_yaw = math.cos(robot_yaw)
+    x = dx * cos_yaw - dy * sin_yaw
+    y = dx * sin_yaw + dy * cos_yaw
+    yaw = angles.normalize_angle(target_yaw - robot_yaw)
+    return x, y, yaw
 
 
 class PoseUtils:

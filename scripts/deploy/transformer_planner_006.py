@@ -1,5 +1,5 @@
 from transformer_planner import TransformerPlanner
-from utils.parameters import *
+from ..utils.parameters import *
 import os
 import rospy
 from geometry_msgs.msg import Twist, PoseStamped

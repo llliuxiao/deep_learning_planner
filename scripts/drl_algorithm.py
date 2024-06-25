@@ -1,7 +1,8 @@
 # utils
-from typing import Callable, Tuple, Optional
+from typing import Callable
 import gymnasium.spaces as spaces
 import re
+import gymnasium as gym
 
 # torch
 import numpy as np
@@ -12,8 +13,12 @@ import torch.nn.functional as F
 # stable-baseline3
 from stable_baselines3.common.utils import explained_variance
 from stable_baselines3.ppo import PPO
-from stable_baselines3.common.type_aliases import PyTorchObs
 from stable_baselines3.common.policies import ActorCriticPolicy
+
+
+def init_torch_layer_weights(m):
+    if isinstance(m, torch.nn.Linear):
+        torch.nn.init.normal_(m.weight)
 
 
 class ImitationPolicy(ActorCriticPolicy):
@@ -35,28 +40,28 @@ class ImitationPolicy(ActorCriticPolicy):
         )
         self.requires_grad_(False)
         self.eval()
-        self.kl_loss_fn = th.nn.KLDivLoss(log_target=True, reduction="batchmean").to(self.device)
-        self.log_std = th.log(th.tensor([0.03, 0.03], requires_grad=False, dtype=torch.float))
 
-    def calculate_kl_loss(self, obs: PyTorchObs, actions: th.Tensor, actions_log_prob: th.Tensor):
-        with th.no_grad:
-            features = self.extract_features(obs)
-            latent_pi = self.mlp_extractor.forward_actor(features)
-            distribution = self._get_action_dist_from_latent(latent_pi)
-        imitation_log_prob = distribution.log_prob(actions)
-        kl_loss = self.kl_loss_fn(actions_log_prob, imitation_log_prob)
-        return kl_loss
+    def get_imitation_action(self, obs):
+        features = self.extract_features(obs)
+        latent_pi = self.mlp_extractor.forward_actor(features)
+        action = self.action_net(latent_pi)
+        return action
 
 
 class CustomPPO(PPO):
-    def __init__(self, **kwargs):
+    def __init__(self, target_value: float, **kwargs):
         super().__init__(**kwargs)
         self.imitation_policy = ImitationPolicy(self.observation_space, self.action_space, self.lr_schedule)
-        self.target_kl_loss = torch.zeros(1).requires_grad(False)
-        self.log_temperature = th.log(th.ones(1)).requires_grad(True)
-        self.temperature_optimizer = th.optim.Adam(params=[self.log_temperature], lr=self.lr_schedule(1))
+        self.target_value = torch.tensor(target_value, dtype=torch.float, requires_grad=False).to(self.device)
+        self.temperature = th.tensor(1.0, dtype=torch.float).to(self.device)
+        self.temperature.requires_grad = True
+        self.temperature_optimizer = th.optim.Adam(params=[self.temperature], lr=self.lr_schedule(1.0))
 
-    def load_state_dict(self, model_file: str):
+    def load_state_dict(self, model_file: str = None):
+        if model_file is None:
+            self.policy.apply(init_torch_layer_weights)
+            self.imitation_policy.apply(init_torch_layer_weights)
+            return
         param = th.load(model_file)["model_state_dict"]
         feature_extractor_param = {}
         mlp_extractor_param = {}
@@ -95,7 +100,8 @@ class CustomPPO(PPO):
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
-        kl_losses = []
+        temperatures = [self.temperature.item()]
+        regularization_losses = []
 
         continue_training = True
         # train for n_epochs epochs
@@ -113,18 +119,6 @@ class CustomPPO(PPO):
                     self.policy.reset_noise(self.batch_size)
 
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
-                """
-                define kl loss
-                """
-                kl_loss = self.imitation_policy.calculate_kl_loss(rollout_data.observations, actions, log_prob)
-                temperature = torch.exp(self.log_temperature.detach())
-                kl_loss = temperature * kl_loss
-                kl_losses.append(kl_loss)
-
-                self.temperature_optimizer.zero_grad()
-                kl_loss.backward()
-                self.temperature_optimizer.step()
-
                 values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
@@ -155,6 +149,9 @@ class CustomPPO(PPO):
                         values - rollout_data.old_values, -clip_range_vf, clip_range_vf
                     )
                 # Value loss using the TD(gae_lambda) target
+                """
+                notice that the rollout_data return should not calculate gradient
+                """
                 value_loss = F.mse_loss(rollout_data.returns, values_pred)
                 value_losses.append(value_loss.item())
 
@@ -167,7 +164,23 @@ class CustomPPO(PPO):
 
                 entropy_losses.append(entropy_loss.item())
 
-                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + self.log_temperature * kl_loss
+                ############################################################################################
+                """
+                add a regularization here to narrow the gap between imitation policy and reinforcement policy
+                """
+                imitation_action = self.imitation_policy.get_imitation_action(rollout_data.observations).detach()
+                _, imitation_log_prob, _ = self.policy.evaluate_actions(rollout_data.observations, imitation_action)
+                regularization = -torch.mean(imitation_log_prob)
+                regularization_losses.append(regularization.detach().item())
+                ############################################################################################
+
+                ############################################################################################
+                """
+                total loss function
+                """
+                loss = (policy_loss + self.ent_coef * entropy_loss +
+                        self.vf_coef * value_loss + self.temperature.detach() * regularization)
+                ############################################################################################
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -191,6 +204,22 @@ class CustomPPO(PPO):
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
 
+                ############################################################################################
+                """
+                optimize the temperature
+                """
+                self.temperature.requires_grad = True
+                temperature_loss = self.temperature * torch.mean(values.detach() - self.target_value)
+                self.temperature_optimizer.zero_grad()
+                with torch.autograd.detect_anomaly(True):
+                    temperature_loss.backward()
+                self.temperature_optimizer.step()
+                with torch.no_grad():
+                    self.temperature = F.softplus(self.temperature)
+                    self.temperature = th.clamp(self.temperature, 0.0, 1.0)
+                    temperatures.append(self.temperature.item())
+                ############################################################################################
+
             self._n_updates += 1
             if not continue_training:
                 break
@@ -201,11 +230,12 @@ class CustomPPO(PPO):
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
-        self.logger.record("train/kl_loss", np.mean(kl_losses))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/temperature", np.mean(temperatures))
+        self.logger.record("train/regularization", np.mean(regularization_losses))
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
@@ -213,3 +243,16 @@ class CustomPPO(PPO):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+
+
+def main():
+    env = gym.make("LunarLanderContinuous-v2")
+    model = CustomPPO(target_value=100, policy="MlpPolicy", env=env, device="cpu", verbose=1)
+    model.load_state_dict()
+    model.learn(total_timesteps=int(1e7))
+    model.save("custom_ppo_lunar")
+
+
+if __name__ == "__main__":
+    print("test custom ppo with continuous environment LunarLanderContinuous-v2 in gymnasium")
+    main()
