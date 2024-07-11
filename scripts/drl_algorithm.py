@@ -15,6 +15,8 @@ from stable_baselines3.common.utils import explained_variance
 from stable_baselines3.ppo import PPO
 from stable_baselines3.common.policies import ActorCriticPolicy
 
+from transformer_drl_network import TransformerFeatureExtractor, CustomActorCriticPolicy, CustomMlpExtractor
+
 
 def init_torch_layer_weights(m):
     if isinstance(m, torch.nn.Linear):
@@ -24,10 +26,10 @@ def init_torch_layer_weights(m):
 class ImitationPolicy(ActorCriticPolicy):
     def __init__(
             self,
+            device,
             observation_space: spaces.Space,
             action_space: spaces.Space,
             lr_schedule: Callable[[float], float],
-            *args,
             **kwargs,
     ):
         kwargs["ortho_init"] = False
@@ -35,9 +37,9 @@ class ImitationPolicy(ActorCriticPolicy):
             observation_space,
             action_space,
             lr_schedule,
-            *args,
             **kwargs,
         )
+        self.to(device)
         self.requires_grad_(False)
         self.eval()
 
@@ -47,17 +49,21 @@ class ImitationPolicy(ActorCriticPolicy):
         action = self.action_net(latent_pi)
         return action
 
+    def _build_mlp_extractor(self) -> None:
+        self.mlp_extractor = CustomMlpExtractor(feature_dim=self.features_dim)
+
 
 class CustomPPO(PPO):
     def __init__(self, target_value: float, **kwargs):
         super().__init__(**kwargs)
-        self.imitation_policy = ImitationPolicy(self.observation_space, self.action_space, self.lr_schedule)
+        self.imitation_policy = ImitationPolicy(self.device, self.observation_space, self.action_space,
+                                                self.lr_schedule, **(kwargs["policy_kwargs"]))
         self.target_value = torch.tensor(target_value, dtype=torch.float, requires_grad=False).to(self.device)
         self.temperature = th.tensor(1.0, dtype=torch.float).to(self.device)
         self.temperature.requires_grad = True
         self.temperature_optimizer = th.optim.Adam(params=[self.temperature], lr=self.lr_schedule(1.0))
 
-    def load_state_dict(self, model_file: str = None):
+    def load_state_dict(self, model_file: str = None, deterministic=False):
         if model_file is None:
             self.policy.apply(init_torch_layer_weights)
             self.imitation_policy.apply(init_torch_layer_weights)
@@ -79,9 +85,13 @@ class CustomPPO(PPO):
         self.policy.features_extractor.load_state_dict(feature_extractor_param)
         self.policy.mlp_extractor.mlp_extractor_actor.load_state_dict(mlp_extractor_param)
         self.policy.action_net.load_state_dict(action_net_param)
-        self.imitation_policy.model.features_extractor.load_state_dict(feature_extractor_param)
-        self.imitation_policy.model.mlp_extractor.mlp_extractor_actor.load_state_dict(mlp_extractor_param)
-        self.imitation_policy.model.action_net.load_state_dict(action_net_param)
+        self.imitation_policy.features_extractor.load_state_dict(feature_extractor_param)
+        self.imitation_policy.mlp_extractor.mlp_extractor_actor.load_state_dict(mlp_extractor_param)
+        self.imitation_policy.action_net.load_state_dict(action_net_param)
+        self.policy.features_extractor.requires_grad_(False)
+        print(self.imitation_policy.device)
+        if deterministic:
+            self.policy.requires_grad_(False)
 
     def train(self) -> None:
         """
@@ -102,6 +112,7 @@ class CustomPPO(PPO):
         clip_fractions = []
         temperatures = [self.temperature.item()]
         regularization_losses = []
+        record_values = []
 
         continue_training = True
         # train for n_epochs epochs
@@ -120,6 +131,7 @@ class CustomPPO(PPO):
 
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
+                record_values.append(torch.mean(values).cpu().item())
                 # Normalize advantage
                 advantages = rollout_data.advantages
                 # Normalization does not make sense if mini batchsize == 1, see GH issue #325
@@ -206,13 +218,12 @@ class CustomPPO(PPO):
 
                 ############################################################################################
                 """
-                optimize the temperature
+                update the temperature
                 """
                 self.temperature.requires_grad = True
                 temperature_loss = self.temperature * torch.mean(values.detach() - self.target_value)
                 self.temperature_optimizer.zero_grad()
-                with torch.autograd.detect_anomaly(True):
-                    temperature_loss.backward()
+                temperature_loss.backward()
                 self.temperature_optimizer.step()
                 with torch.no_grad():
                     self.temperature = F.softplus(self.temperature)
@@ -227,6 +238,7 @@ class CustomPPO(PPO):
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
         # Logs
+        self.logger.record("train/value", np.mean(record_values))
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
@@ -247,8 +259,23 @@ class CustomPPO(PPO):
 
 def main():
     env = gym.make("LunarLanderContinuous-v2")
-    model = CustomPPO(target_value=100, policy="MlpPolicy", env=env, device="cpu", verbose=1)
-    model.load_state_dict()
+    policy_kwargs = dict(
+        features_extractor_class=TransformerFeatureExtractor,
+        features_extractor_kwargs=dict(features_dim=512),
+        net_arch=dict(pi=[256], qf=[128]),
+    )
+    model = CustomPPO(target_value=200,
+                      policy=CustomActorCriticPolicy,
+                      env=env,
+                      verbose=2,
+                      learning_rate=1e-5,
+                      batch_size=512,
+                      n_epochs=10,
+                      n_steps=1024,
+                      gamma=0.99,
+                      policy_kwargs=policy_kwargs,
+                      device=torch.device("cuda"))
+    model.load_state_dict("/home/gr-agv-lx91/isaac_sim_ws/src/deep_learning_planner/transformer_logs/model10/best.pth")
     model.learn(total_timesteps=int(1e7))
     model.save("custom_ppo_lunar")
 

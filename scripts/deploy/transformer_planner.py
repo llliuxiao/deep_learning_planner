@@ -20,9 +20,9 @@ from tf2_ros import Buffer
 from tf2_ros.transform_listener import TransformListener
 
 # customer module
-from ..utils.parameters import *
-from ..utils.pose_utils import distance_points2d
-from ..transformer_network import RobotTransformer
+from src.deep_learning_planner.scripts.utils.parameters import *
+from src.deep_learning_planner.scripts.utils.pose_utils import distance_points2d
+from src.deep_learning_planner.scripts.transformer_network import RobotTransformer
 
 
 class TransformerPlanner:

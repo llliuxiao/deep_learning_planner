@@ -50,13 +50,13 @@ from deep_learning_planner.msg import RewardFunction
 # Stable-baseline3
 from stable_baselines3.common.callbacks import CallbackList
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.ppo import PPO
 
 # customer code
 from utils.parameters import *
 from utils.pose_utils import PoseUtils, get_yaw, get_roll, get_pitch, calculate_geodesic_distance
 from transformer_drl_network import TransformerFeatureExtractor, CustomActorCriticPolicy
 from utils.sb3_callbacks import CustomCallback
+from drl_algorithm import CustomPPO
 
 
 class TrainingState(enum.Enum):
@@ -85,8 +85,8 @@ class Environment(gym.Env):
         self.num_envs = 1
         self.action_space = spaces.Box(low=np.array([0.0, -1.0]), high=np.array([1.0, 1.0]), shape=(2,), dtype=float)
         self.observation_space = spaces.Dict({
-            "laser": spaces.Box(low=0., high=1.0, shape=(6, 1080), dtype=float),
-            "global_plan": spaces.Box(low=-1., high=1., shape=(20, 3), dtype=float),
+            "laser": spaces.Box(low=0., high=1.0, shape=(laser_length, laser_shape), dtype=float),
+            "global_plan": spaces.Box(low=-1., high=1., shape=(look_ahead_poses, 3), dtype=float),
             "goal": spaces.Box(low=-math.inf, high=math.inf, shape=(3,), dtype=float)
         })
 
@@ -458,7 +458,7 @@ class Environment(gym.Env):
         self.world.reset()
 
 
-def load_network_parameters(net_model, model_file, mode):
+def load_network_parameters(net_model, model_file, deterministic):
     param = torch.load(model_file)["model_state_dict"]
     feature_extractor_param = {}
     mlp_extractor_param = {}
@@ -477,9 +477,8 @@ def load_network_parameters(net_model, model_file, mode):
     net_model.mlp_extractor.mlp_extractor_actor.load_state_dict(mlp_extractor_param)
     net_model.action_net.load_state_dict(action_net_param)
     net_model.features_extractor.requires_grad_(False)
-    if mode is True:
-        net_model.mlp_extractor.requires_grad_(False)
-        net_model.action_net.requires_grad_(False)
+    if deterministic:
+        net_model.requires_grad_(False)
 
 
 if __name__ == "__main__":
@@ -504,18 +503,20 @@ if __name__ == "__main__":
         # optimizer_kwargs=dict(weight_decay=0.00001),
     )
     CustomActorCriticPolicy.deterministic = args.deterministic
-    model = PPO(CustomActorCriticPolicy,
-                env=env,
-                verbose=2,
-                learning_rate=1e-5,
-                batch_size=512,
-                tensorboard_log=args.save_logdir,
-                n_epochs=10,
-                n_steps=1024,
-                gamma=0.99,
-                policy_kwargs=policy_kwargs,
-                device=torch.device("cuda:1"))
-    load_network_parameters(model.policy, args.model_file, args.deterministic)
+    model = CustomPPO(target_value=200,
+                      policy=CustomActorCriticPolicy,
+                      env=env,
+                      verbose=2,
+                      learning_rate=3e-4,
+                      batch_size=512,
+                      tensorboard_log=args.save_logdir,
+                      n_epochs=10,
+                      n_steps=1024,
+                      gamma=0.99,
+                      policy_kwargs=policy_kwargs,
+                      device=torch.device("cuda:1"))
+    # load_network_parameters(model.policy, args.model_file, args.deterministic)
+    model.load_state_dict(args.model_file, args.deterministic)
     save_reward_callback = CustomCallback(check_freq=1024, log_dir=args.save_logdir)
     callback_list = CallbackList([save_reward_callback])
     model.learn(total_timesteps=args.step,

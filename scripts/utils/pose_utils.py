@@ -11,10 +11,7 @@ from tf.transformations import euler_from_quaternion, quaternion_from_euler
 import random
 import math
 import json
-import sys
 import angles
-
-sys.path.append("/usr/lib/python3/dist-packages")
 
 
 def get_yaw(quaternion: Quaternion):
