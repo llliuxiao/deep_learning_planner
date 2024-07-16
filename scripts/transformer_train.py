@@ -9,9 +9,10 @@ from torch.utils.tensorboard import SummaryWriter
 # visualization
 from tqdm import tqdm
 
-from data.data import load_data
+from data.gazebo_data import load_data
 from transformer_network import RobotTransformer
 from utils.parameters import *
+from sequence import SequenceModel
 
 linux_user = os.getlogin()
 save_root = f"/home/{linux_user}/isaac_sim_ws/src/deep_learning_planner/transformer_logs"
@@ -162,6 +163,7 @@ class Trainner:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "epoch": num
             }
+            print(f"save best model on epoch:{num}")
             torch.save(checkpoint, f"{model_save_dir}/best.pth")
 
 

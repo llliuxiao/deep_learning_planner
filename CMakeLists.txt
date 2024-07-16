@@ -149,8 +149,8 @@ include_directories(
 
 ## Specify libraries to link a library or executable target against
 # target_link_libraries(${PROJECT_NAME}_node
-#   ${catkin_LIBRARIES}
-# )
+#  ${catkin_LIBRARIES}
+#)
 
 #############
 ## Install ##
@@ -162,7 +162,7 @@ include_directories(
 ## Mark executable scripts (Python etc.) for installation
 ## in contrast to setup.py, you can choose the destination
  catkin_install_python(PROGRAMS
-   scripts/data/trajectory_recorder.py
+#   scripts/data/trajectory_recorder.py
    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
  )
 

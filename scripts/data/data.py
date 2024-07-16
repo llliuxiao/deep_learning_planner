@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 from einops import repeat
 from torch.utils.data import DataLoader, Dataset
-from parameters import *
+from src.deep_learning_planner.scripts.utils.parameters import *
 
 dataset_root = "/home/gr-agv-lx91/Downloads/pretraining_dataset"
 scenes = ["hospital", "office"]

@@ -12,8 +12,12 @@ import threading
 import copy
 import enum
 import json
+import time
+
 import numpy as np
 from tqdm import tqdm
+import subprocess
+import argparse
 
 sys.path.append(f"/home/{os.getlogin()}/isaac_sim_ws/devel/lib/python3/dist-packages")
 
@@ -36,13 +40,6 @@ import message_filters
 # robot parameters:
 robot_radius = 0.5
 
-# global const
-max_step = 500000
-linux_user = os.getlogin()
-dataset_root_path = f"/home/{linux_user}/Downloads/pretraining_dataset_local_path/hospital"
-if not os.path.exists(dataset_root_path):
-    os.mkdir(dataset_root_path)
-
 
 class RobotState(enum.Enum):
     REACHED = 1
@@ -51,9 +48,11 @@ class RobotState(enum.Enum):
 
 
 class TrajectoryRecorder:
-    def __init__(self):
+    def __init__(self, max_step, dataset_root_path):
         # To reset Simulations
         rospy.logdebug("START init trajectory recorder")
+        self.dataset_root_path = dataset_root_path
+        self.max_step = max_step
 
         # visual
         self.pbar = tqdm(total=max_step)
@@ -97,6 +96,10 @@ class TrajectoryRecorder:
         # flags
         self._goal_reached = False
         self.state = RobotState.RUNNING
+        self.map = None
+        while self.map is None:
+            print("wait for map")
+            time.sleep(1.0)
 
         self.dataset_thread.start()
         self.reset(0)
@@ -151,12 +154,13 @@ class TrajectoryRecorder:
             rospy.logfatal("the type of return of tf buffer transform is not PoseStamped, system exits modify it now!")
             sys.exit(-1)
 
-        laser_path = os.path.join(f"{dataset_root_path}/trajectory{self.trajectory_num}", f"laser{self.step_num}.npy")
+        laser_path = os.path.join(f"{self.dataset_root_path}/trajectory{self.trajectory_num}",
+                                  f"laser{self.step_num}.npy")
         global_plan_path = os.path.join(
-            f"{dataset_root_path}/trajectory{self.trajectory_num}",
+            f"{self.dataset_root_path}/trajectory{self.trajectory_num}",
             f"global_plan{self.step_num}.npy")
         local_plan_path = os.path.join(
-            f"{dataset_root_path}/trajectory{self.trajectory_num}",
+            f"{self.dataset_root_path}/trajectory{self.trajectory_num}",
             f"local_plan{self.step_num}.npy")
         assert isinstance(robot_pose, TransformStamped)
 
@@ -191,9 +195,9 @@ class TrajectoryRecorder:
         self.trajectory_num = trajectory_num
         self.step_num = 0
 
-        if os.path.exists(f"{dataset_root_path}/trajectory{trajectory_num}"):
-            os.system(f"rm -rf {dataset_root_path}/trajectory{trajectory_num}")
-        os.mkdir(f"{dataset_root_path}/trajectory{trajectory_num}")
+        if os.path.exists(f"{self.dataset_root_path}/trajectory{trajectory_num}"):
+            os.system(f"rm -rf {self.dataset_root_path}/trajectory{trajectory_num}")
+        os.mkdir(f"{self.dataset_root_path}/trajectory{trajectory_num}")
 
         # reset robot pose in isaac sim
         self.start_pose = self._get_random_pos_on_map(self.map)
@@ -240,7 +244,7 @@ class TrajectoryRecorder:
 
     def close(self):
         rospy.logfatal("Closing IsaacSim")
-        with open(os.path.join(dataset_root_path, "dataset_info.json"), "w") as file:
+        with open(os.path.join(self.dataset_root_path, "dataset_info.json"), "w") as file:
             json.dump(self.dataset_info, fp=file)
         self.pbar.close()
         self.close_client.call()
@@ -316,7 +320,7 @@ class TrajectoryRecorder:
         del self.dataset_info[f"trajectory{trajectory_num}"]
 
     def reset_pbar(self, last_step):
-        self.pbar.reset(total=max_step)
+        self.pbar.reset(total=self.max_step)
         self.pbar.update(last_step)
 
     # Goal State Code
@@ -341,25 +345,42 @@ class TrajectoryRecorder:
 
 if __name__ == "__main__":
     rospy.init_node("trajectory_recorder")
-    recorder = TrajectoryRecorder()
-    num = 0
-    step = 0
-    while step < max_step:
+    parse = argparse.ArgumentParser()
+    parse.add_argument("--scene", type=str, default="office", required=True, help="the data sample scene")
+    parse.add_argument("--max_step", type=int, default=100000, required=True, help="the number of step to be sampled")
+    parse.add_argument("--dir", type=str, required=True, help="the directory of the dataset")
+    args = parse.parse_args()
+    navigation_process = subprocess.Popen(
+        ["roslaunch", "isaac_sim", "single_robot_navigation.launch", f"map:={args.scene}"]
+    )
+    time.sleep(3.0)
+    isaac_process = subprocess.Popen(
+        [f"/home/{os.getlogin()}/.local/share/ov/pkg/isaac_sim-2023.1.1/python.sh",
+         f"/home/{os.getlogin()}/isaac_sim_ws/src/isaac_sim/scripts/environment.py",
+         "--scene", args.scene]
+    )
+    time.sleep(20.0)
+    recorder = TrajectoryRecorder(max_step=args.max_step, dataset_root_path=args.dir)
+    trajectory_num, step = 0, 0
+    while step < args.max_step:
         while True:
             if recorder.state == RobotState.REACHED:
                 rospy.loginfo("\nReach the goal")
                 rospy.sleep(2.0)
-                num += 1
+                trajectory_num += 1
                 step += recorder.step_num
                 break
             elif recorder.state == RobotState.TRAPPED:
                 rospy.logfatal("\nTrapped")
                 rospy.sleep(2.0)
-                recorder.clear_collision_trajectory(num)
+                recorder.clear_collision_trajectory(trajectory_num)
                 recorder.reset_pbar(step)
                 break
             rospy.sleep(0.05)
-        if step < max_step:
-            recorder.reset(num)
+        if step < args.max_step:
+            recorder.reset(trajectory_num)
     recorder.close()
+    isaac_process.wait()
+    navigation_process.terminate()
+    navigation_process.wait()
     print("shut down")
