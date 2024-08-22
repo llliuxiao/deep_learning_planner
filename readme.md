@@ -3,18 +3,41 @@
 ## Install
 
 ```shell
-git clone git@gitlab.geometryrobot.com:learning/rl/deep_learning_planner.git
+git clone https://github.com/llliuxiao/isaac_sim.git
 ```
+
+## Dependency
+
+- python
+- isaac sim
+- ros1
+- stable-baseline3
+- pytorch
+- gymnasium
+- einops
+- argparse
+- beartype
+- isaac_sim
+
+## Neural Network
+
+![network](imgs/network.png)
+
+## Video Demo
+
+<video src="imgs/jackal.mp4"></video>
+
+<video src="imgs/real-robot.mp4"></video>
 
 ## Usage
 
-#### lfd training
+#### imitation learning training
 
 ```shell
 python scripts/transformer_train.py
 ```
 
-#### drl training
+#### deep reinforcement learning training
 
 ```shell
 roslaunch isaac_sim simple_navigation map:=$scene
@@ -22,7 +45,7 @@ roslaunch isaac_sim simple_navigation map:=$scene
 $ISAAC_SIM_PYTHON scripts/drl_train.py --scene $scene
 ```
 
-#### deploy
+#### real-robot-deploy
 
 the imitation mode or reinforcement mode could be adjusted with shell args, sim or real robot as well
 
@@ -43,3 +66,5 @@ not totally implemented yet, only a basic framework without fully test
 ## Reference
 
 - DRL-VO
+- RT1
+- From Perception to Decision: A Data-driven Approach to End-to-endMotion Planning for Autonomous Ground Robots
