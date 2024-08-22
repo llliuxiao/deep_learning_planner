@@ -25,9 +25,9 @@ git clone https://github.com/llliuxiao/isaac_sim.git
 
 ## Video Demo
 
-<video src="imgs/jackal.mp4"></video>
+![jackal](imgs/jackal.gif)
 
-<video src="imgs/real-robot.mp4"></video>
+![real-robot](imgs/real-robot.gif)
 
 ## Usage
 
