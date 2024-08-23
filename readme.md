@@ -19,9 +19,11 @@ git clone https://github.com/llliuxiao/isaac_sim.git
 - beartype
 - isaac_sim
 
-## Neural Network
+## Structure
 
 ![network](imgs/network.png)
+
+![structure](imgs/structure.png)
 
 ## Video Demo
 
